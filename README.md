@@ -62,7 +62,6 @@ Codex 的提问发生在一轮末尾：它把问题写出来、结束这一轮�
 
 ## 要求
 
-- macOS 或 Linux
 - [Bun](https://bun.sh) >= 1.4（需要 `ws+unix://` 支持）
 - Codex CLI，已登录。脚本会自动启动本地 daemon（`codex app-server daemon start`），不开远程控制。
 

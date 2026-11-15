@@ -32,10 +32,12 @@
 | `started` | 线程已创建，带 `threadId`、`name`，以及 `observe`：一条可以直接复制的旁观命令，Claude 会转告给你 |
 | `turn_completed` | 一轮结束，`text` 是 Codex 的最后一条消息（汇报或提问） |
 | `approval_requested` | Codex 请求越权操作，带 `requestId`、`command`、`reason` |
-| `approval_resolved` | 审批已落实（含超时自动拒绝） |
+| `approval_resolved` | 审批超时，已自动拒绝。正常的批准或拒绝不上报 |
 | `heartbeat` | 太久没有唤醒 Claude，发一个事件让它的缓存续期；Codex 不受影响，仍在跑 |
-| `reconnecting` / `reconnected` | 连接断开后自动重连 |
+| `approvals_dropped` | 连接断开重连后，旧连接上未决的审批请求失效，带 `requestIds` |
 | `error` / `closed` / `unsupported_request` | 出错、结束、收到不支持的请求 |
+
+每输出一个事件，Claude 就被唤醒一次、重读一遍上下文，所以只上报需要它处理的事：正常的批准或拒绝、重连成功都不出声。
 
 Codex 的提问发生在一轮末尾：它把问题写出来、结束这一轮，Claude 回复后继续。不能在一轮中途停下来等回复。
 
@@ -68,10 +70,10 @@ Claude 每被唤醒一次，它的 prompt 缓存有效期就从头算。静默�
 
 ## 保活
 
-- 连接断开自动重连（指数退避，最长 15 秒一次，10 分钟放弃）。
+- 连接断开自动重连（指数退避，最长 15 秒一次，10 分钟放弃）。重连成功不上报，放弃时输出 `closed`。
 - 每 30 秒探活一次，连接静默死掉也能发现。
 - 最后上报到哪一轮记在状态目录里。重连或重新 `watch` 后，补发这之后完成的所有轮次，不重复上报。
-- 重连会使旧连接上未决的审批请求失效，需要 Codex 重新发起。
+- 重连会使旧连接上未决的审批请求失效，这时输出 `approvals_dropped`，需要 Codex 重新发起。
 
 ## 安装
 
@@ -100,6 +102,7 @@ Claude 每被唤醒一次，它的 prompt 缓存有效期就从头算。静默�
 - 升级：在 `/plugin` 界面里更新插件市场和插件，然后重启 Claude Code。
 - 卸载：`/plugin uninstall claude-codex-bridge`。状态文件在 `~/.local/state/claude-codex-bridge/`，不再需要可以直接删除。
 - 从 0.2 升级：`quiet_timeout` 事件已改为 `heartbeat`，静默到上限时不再中断 Codex；`--max-quiet` 默认值从 4 改为 50 分钟。
+- 从 0.3.1 升级：为了少唤醒 Claude，`reconnecting` / `reconnected` 不再上报，`approval_resolved` 只在超时自动拒绝时上报；新增 `approvals_dropped`。
 
 ## 使用
 

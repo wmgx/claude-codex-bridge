@@ -159,7 +159,9 @@ export class Session {
       if (!decision && !expired) continue;
       this.approvals.delete(requestId);
       this.client?.respond(p.reqId, { decision: decision ?? "decline" });
-      this.emit({ event: "approval_resolved", threadId: this.threadId, requestId, decision: decision ?? "decline", timedOut: !decision });
+      // 正常批准或拒绝是 Claude 自己刚执行的，不用再唤醒它一次；只有超时自动拒绝才上报。
+      if (decision) this.rearmQuiet();
+      else this.emit({ event: "approval_resolved", threadId: this.threadId, requestId, decision: "decline", timedOut: true });
     }
   }
 
@@ -172,8 +174,8 @@ export class Session {
   private async reconnect() {
     if (this.reconnecting) return;
     this.reconnecting = true;
-    this.approvals.clear(); // 旧连接上的审批请求随连接失效
-    this.emit({ event: "reconnecting", threadId: this.threadId });
+    const dropped = [...this.approvals.keys()]; // 旧连接上的审批请求随连接失效
+    this.approvals.clear();
     const giveUp = Date.now() + RECONNECT_GIVE_UP_MS;
     let delay = 1000;
     while (Date.now() < giveUp) {
@@ -183,7 +185,8 @@ export class Session {
         this.attach(c);
         await this.resume(c);
         this.reconnecting = false;
-        this.emit({ event: "reconnected", threadId: this.threadId });
+        // 重连成功不出声，省一次唤醒；只有作废了未决审批才需要让 Claude 知道。
+        if (dropped.length) this.emit({ event: "approvals_dropped", threadId: this.threadId, requestIds: dropped });
         return;
       } catch {
         await sleep(delay);

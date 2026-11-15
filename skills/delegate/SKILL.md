@@ -23,7 +23,7 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 
 | event | 怎么处理 |
 |---|---|
-| `started` | 记下 `threadId` 和 `name` |
+| `started` | 记下 `threadId` 和 `name`，并**立刻把 `observe` 里的命令原样告诉用户**："你可以用这条命令旁观 Codex 在做什么：`<observe>`"。每次派活都要说，不要省略、不要改写命令 |
 | `turn_completed` | 读 `text`：是汇报就**自己核对**再向用户转述；是提问就回答 |
 | `approval_requested` | **转给用户决定**，见下 |
 | `approval_resolved` | 审批已落实，等下一个事件 |
@@ -34,7 +34,7 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 
 任务结束、不再需要这个线程时，**停掉 Monitor**，不要让监听进程空挂到到期。
 
-用户想自己看 Codex 在做什么时，告诉他可以运行 `codex resume <线程ID或名字> --remote unix://` 旁观，只看不发消息，审批仍回到这边处理。
+旁观命令必须带线程 ID（名字不行），所以以事件里的 `observe` 字段为准；`watch` 重新挂上时的 `watching` 事件里也有。提醒用户只看不发消息，审批仍回到这边处理。
 
 ## 审批：批准权在用户手里
 

@@ -67,6 +67,9 @@ function textOf(pos: string[], flags: Flags, idx: number): string {
   return text;
 }
 
+// 用户旁观这个线程用的命令：把 Codex 终端界面连到同一个 daemon。只认线程 ID，不认名字。
+const observeCommand = (threadId: string) => `codex resume ${threadId} --remote unix://`;
+
 async function connected(): Promise<Client> {
   await ensureDaemon();
   return Client.connect();
@@ -106,7 +109,7 @@ async function main() {
     session.attach(c);
     session.run();
     await sendTurn(c, threadId, text);
-    out({ event: "started", threadId, name, mode: "auto", maxQuietMinutes: quiet / 60_000 });
+    out({ event: "started", threadId, name, mode: "auto", maxQuietMinutes: quiet / 60_000, observe: observeCommand(threadId) });
     return;
   }
 
@@ -122,7 +125,7 @@ async function main() {
     session.attach(c);
     await session.resume(c);
     session.run();
-    out({ event: "watching", threadId, maxQuietMinutes: quiet / 60_000 });
+    out({ event: "watching", threadId, maxQuietMinutes: quiet / 60_000, observe: observeCommand(threadId) });
     return;
   }
 

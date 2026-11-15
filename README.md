@@ -29,7 +29,7 @@
 
 | event | 含义 |
 |---|---|
-| `started` | 线程已创建，带 `threadId`、`name` |
+| `started` | 线程已创建，带 `threadId`、`name`，以及 `observe`：一条可以直接复制的旁观命令，Claude 会转告给你 |
 | `turn_completed` | 一轮结束，`text` 是 Codex 的最后一条消息（汇报或提问） |
 | `approval_requested` | Codex 请求越权操作，带 `requestId`、`command`、`reason` |
 | `approval_resolved` | 审批已落实（含超时自动拒绝） |
@@ -110,7 +110,9 @@ Claude 每被唤醒一次，它的 prompt 缓存有效期就从头算。静默�
 bridge 开的是 Codex 本地 daemon 上的普通线程，可以用 Codex 自己的客户端连上去看：
 
 - `codex agents`：浏览 daemon 上的所有会话，bridge 开的显示为 `[bridge] <名字>`。
-- `codex resume <线程ID或名字> --remote unix://`：把 Codex 终端界面连到同一个 daemon，实时看它在跑什么命令、改什么文件。
+- `codex resume <线程ID> --remote unix://`：把 Codex 终端界面连到同一个 daemon，实时看它在跑什么命令、改什么文件。必须用线程 ID，名字不行。
+
+每次派活后，`started` 事件的 `observe` 字段里就是填好线程 ID 的这条命令，Claude 会直接告诉你；`watch` 重新挂上时的 `watching` 事件里也有。
 
 注意：
 

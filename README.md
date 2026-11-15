@@ -8,8 +8,8 @@
 
 | 命令 | 作用 |
 |---|---|
-| `start <cwd> <text> [--name N] [--budget M]` | 开线程，发第一轮，之后持续输出事件 |
-| `watch <thread> [--budget M]` | 重新订阅已有线程的事件，不重放已上报的轮次 |
+| `start <cwd> <text> [--name N] [--max-quiet M]` | 开线程，发第一轮，之后持续输出事件 |
+| `watch <thread> [--max-quiet M]` | 重新订阅已有线程的事件，不重放已上报的轮次 |
 | `send <thread> <text>` | 在同一线程继续发一轮 |
 | `approve <thread> <id> [--session]` / `deny <thread> <id>` | 回应审批请求 |
 | `list` | 列出 claude-codex-bridge 开过的线程 |
@@ -29,7 +29,7 @@
 | `turn_completed` | 一轮结束，`text` 是 Codex 的最后一条消息（汇报或提问） |
 | `approval_requested` | Codex 请求越权操作，带 `requestId`、`command`、`reason` |
 | `approval_resolved` | 审批已落实（含超时自动拒绝） |
-| `budget_exceeded` | 一轮跑超时，已中断；随后会有一条 `status: interrupted` 的 `turn_completed` |
+| `quiet_timeout` | 太久没有唤醒 Claude，已中断 Codex；随后会有一条 `status: interrupted` 的 `turn_completed` |
 | `reconnecting` / `reconnected` | 连接断开后自动重连 |
 | `error` / `closed` / `unsupported_request` | 出错、结束、收到不支持的请求 |
 
@@ -43,15 +43,18 @@ Codex 的提问发生在一轮末尾：它把问题写出来、结束这一轮�
 - 越出沙箱（如写家目录、联网）时，Codex 发出审批请求，变成 `approval_requested` 事件，**由用户决定**，Claude 不替用户批准。10 分钟无人回复自动拒绝。
 - 只读任务请在任务描述里写明"只读，不要改文件"。
 
-## 时限：跑太久就停下，问用户是否继续
+## 静默上限：避免 Claude 缓存过期导致成本飙升
 
-`--budget <分钟>` 限制**单轮**最长运行时间，默认 30，`0` 表示不限，可以是小数。超时后：
+Claude 每被唤醒一次，它的 prompt 缓存有效期就从头算（常见默认 5 分钟）。静默太久缓存会失效，下一个事件把它唤醒时要按全价重读整个上下文，成本飙升。
 
-1. 中断 Codex 当前这一轮（`turn/interrupt`）。
-2. 输出 `budget_exceeded` 事件，Claude 据此问用户"要继续吗"。
-3. 用户同意后 `send <thread> "继续"`，会开新的一轮并重新计时；不同意就到此为止。
+`--max-quiet <分钟>` 控制最长静默时间，默认 4，`0` 表示不限，可以是小数：
 
-说明：插件看不到 Claude 自己的 prompt 缓存是否已失效，所以用"单轮时长"做近似。想让它更早停下，就把 `--budget` 设小。等待审批的时间也算在这一轮里。
+- 每输出一个事件（即唤醒了 Claude），计时重置。
+- Codex 有一轮在跑、且静默达到上限时，**在缓存失效之前**中断这一轮并输出 `quiet_timeout`，趁缓存还热时唤醒 Claude，由它问用户"要继续吗"。
+- 用户同意后 `send <thread> "继续"`，开新的一轮重新计时；不同意就到此为止。
+- 等审批期间不计入：那时 Claude 已经在等用户，不是静默。
+
+说明：插件看不到 Claude 自己的缓存状态，所以上限要由使用者按自己会话的缓存有效期设置。如果会话缓存有效期是 1 小时，可以设成 50 左右，减少不必要的中断。
 
 ## 保活
 

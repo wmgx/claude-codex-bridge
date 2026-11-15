@@ -13,7 +13,7 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 
 1. **先确认方案**。派活前把方案、改动范围、验收标准写清楚，让用户确认。
 2. **首次使用先自检**：`bridge doctor`，按提示修复。
-3. **开线程并监听**：用 `Monitor` 工具运行 `bridge start <目录> "<完整方案>" --name <短名> [--budget <分钟>]`。`--budget` 是单轮最长运行时间，默认 30 分钟，超时 Codex 会被中断并问用户是否继续；预计更久的任务先问用户想设多少，不想限制用 `--budget 0`。该进程一直连着线程，每个事件输出一行 JSON，作为通知唤醒你。不要轮询、不要 sleep。
+3. **开线程并监听**：用 `Monitor` 工具运行 `bridge start <目录> "<完整方案>" --name <短名> [--max-quiet <分钟>]`。`--max-quiet` 是最长静默时间，用来避免你的 prompt 缓存过期后被唤醒、按全价重读上下文：默认 4 分钟（按 5 分钟缓存留余量）；**如果你知道本会话缓存有效期更长（例如 1 小时），就设成"有效期减 10 分钟"左右**；不想限制用 `--max-quiet 0`。该进程一直连着线程，每个事件输出一行 JSON，作为通知唤醒你。不要轮询、不要 sleep。
 4. **处理事件**（见下表）。
 5. **回答或追加指令**：`bridge send <线程名或ID> "<文本>"`。同一线程，上下文保留。
 6. **Monitor 到期**（最长 30 分钟）：线程还需要继续时，用 `bridge watch <线程名或ID>` 重新挂上。已经上报过的轮次不会重放。
@@ -26,7 +26,7 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 | `turn_completed` | 读 `text`：是汇报就**自己核对**再向用户转述；是提问就回答 |
 | `approval_requested` | **转给用户决定**，见下 |
 | `approval_resolved` | 审批已落实，等下一个事件 |
-| `budget_exceeded` | 这一轮跑超时，Codex 已被中断。**问用户是否继续**：同意就 `bridge send <线程> "继续"`（新一轮重新计时），不同意就停下。随后会有一条 `status: interrupted` 的 `turn_completed`，其 `text` 可能为空 |
+| `quiet_timeout` | 静默太久，Codex 已被中断（趁你的缓存还热）。**问用户是否继续**：同意就 `bridge send <线程> "继续"`（新一轮重新计时），不同意就停下。随后会有一条 `status: interrupted` 的 `turn_completed`，其 `text` 可能为空 |
 | `reconnecting` / `reconnected` | 连接自动恢复中，无需处理 |
 | `error` / `closed` | 告诉用户；必要时 `watch` 重新订阅 |
 | `unsupported_request` | Codex 发来了本工具不支持的请求（已自动拒绝），告诉用户 |

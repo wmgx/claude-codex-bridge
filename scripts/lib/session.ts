@@ -32,34 +32,46 @@ export class Session {
   private reconnecting = false;
   private baselined = false;
   private timers: ReturnType<typeof setInterval>[] = [];
-  private budgetTimer?: ReturnType<typeof setTimeout>;
+  private activeTurnId?: string;
+  private quietTimer?: ReturnType<typeof setTimeout>;
 
   // baseline: undefined 表示"以挂上时线程已有的最后一个完成轮为起点，不重放历史"；
   // null 表示线程是刚创建的，之后出现的任何完成轮都要上报。
-  // budgetMs: 单轮最长运行时间，超时就中断这一轮并上报，由 Claude 问用户是否继续；0 表示不限。
-  constructor(readonly threadId: string, private baseline?: string | null, private budgetMs = 0) {
+  //
+  // quietMs: 最长静默时间，0 表示不限。Claude 每被唤醒一次（我们输出一个事件），它的 prompt 缓存有效期
+  // 就从头算；静默太久缓存会失效，下一次唤醒要按全价重读上下文。所以在缓存失效之前就中断 Codex
+  // 并上报，趁缓存还热时唤醒 Claude，由它问用户是否继续。
+  constructor(readonly threadId: string, private baseline?: string | null, private quietMs = 0) {
     if (baseline !== undefined) this.lastEmitted = baseline ?? undefined;
   }
 
-  // 给一个正在运行的轮次计时。startedAtSec 用于重连后扣除已经跑过的时间。
-  private armBudget(turnId: string, startedAtSec?: number | null) {
-    this.clearBudget();
-    if (this.budgetMs <= 0) return;
-    const elapsed = startedAtSec ? Date.now() - startedAtSec * 1000 : 0;
-    this.budgetTimer = setTimeout(() => void this.budgetExceeded(turnId), Math.max(this.budgetMs - elapsed, 0));
+  // 所有对外事件都经过这里：输出即唤醒了 Claude，静默计时重新开始。
+  private emit(o: Record<string, unknown>) {
+    out(o);
+    this.rearmQuiet();
   }
 
-  private clearBudget() {
-    if (this.budgetTimer) clearTimeout(this.budgetTimer);
-    this.budgetTimer = undefined;
+  // 只在有一轮正在跑、且没有审批在等用户时计时（等审批时 Claude 已经在等用户，不算静默）。
+  private rearmQuiet() {
+    if (this.quietTimer) clearTimeout(this.quietTimer);
+    this.quietTimer = undefined;
+    const turnId = this.activeTurnId;
+    if (this.quietMs <= 0 || !turnId || this.approvals.size > 0) return;
+    this.quietTimer = setTimeout(() => void this.quietExceeded(turnId), this.quietMs);
   }
 
-  private async budgetExceeded(turnId: string) {
-    this.budgetTimer = undefined;
+  private async quietExceeded(turnId: string) {
+    this.quietTimer = undefined;
+    this.activeTurnId = undefined; // 触发过就不再重复计时
     let interrupted = true;
     try { await this.client?.request("turn/interrupt", { threadId: this.threadId, turnId }); }
     catch { interrupted = false; }
-    out({ event: "budget_exceeded", threadId: this.threadId, turnId, minutes: this.budgetMs / 60_000, interrupted });
+    this.emit({ event: "quiet_timeout", threadId: this.threadId, turnId, minutes: this.quietMs / 60_000, interrupted });
+  }
+
+  private setActiveTurn(turnId?: string) {
+    this.activeTurnId = turnId;
+    this.rearmQuiet();
   }
 
   // 接管一条已建立的连接（start 用同一条连接开线程，避免漏事件）。
@@ -75,7 +87,7 @@ export class Session {
     await c.request("thread/resume", { threadId: this.threadId, excludeTurns: true });
     const { thread } = await c.request("thread/read", { threadId: this.threadId, includeTurns: true });
     const running = (thread.turns ?? []).find((t: any) => t.status === "inProgress");
-    if (running) this.armBudget(running.id, running.startedAt);
+    if (running) this.setActiveTurn(running.id);
     const done = (thread.turns ?? []).filter((t: any) => t.status !== "inProgress");
     const last = done.at(-1);
     const firstAttach = !this.baselined;
@@ -94,7 +106,7 @@ export class Session {
 
   private emitTurn(turnId: string, status: string, text: string) {
     this.lastEmitted = turnId;
-    out({ event: "turn_completed", threadId: this.threadId, turnId, status, text });
+    this.emit({ event: "turn_completed", threadId: this.threadId, turnId, status, text });
   }
 
   private onNotification(m: any) {
@@ -105,15 +117,15 @@ export class Session {
       const prev = this.texts.get(turnId);
       if (final || !prev?.final) this.texts.set(turnId, { text: item.text ?? "", final });
     } else if (m.method === "turn/started") {
-      this.armBudget(m.params.turn.id, m.params.turn.startedAt);
+      this.setActiveTurn(m.params.turn.id);
     } else if (m.method === "turn/completed") {
-      this.clearBudget();
+      this.setActiveTurn(undefined);
       const t = m.params.turn;
       const text = this.texts.get(t.id)?.text ?? reportOf(t);
       this.texts.delete(t.id);
       this.emitTurn(t.id, t.status, text);
     } else if (m.method === "error") {
-      out({ event: "error", threadId: this.threadId, detail: m.params });
+      this.emit({ event: "error", threadId: this.threadId, detail: m.params });
     }
   }
 
@@ -121,12 +133,12 @@ export class Session {
     const kind = APPROVAL_KIND[m.method];
     if (!kind) {
       this.client?.respondError(m.id, "claude-codex-bridge 不支持这类请求");
-      out({ event: "unsupported_request", threadId: this.threadId, method: m.method });
+      this.emit({ event: "unsupported_request", threadId: this.threadId, method: m.method });
       return;
     }
     const requestId = String(m.id);
     this.approvals.set(requestId, { reqId: m.id, deadline: Date.now() + APPROVAL_TIMEOUT_MS });
-    out({
+    this.emit({
       event: "approval_requested",
       threadId: this.threadId,
       requestId,
@@ -146,7 +158,7 @@ export class Session {
       if (!decision && !expired) continue;
       this.approvals.delete(requestId);
       this.client?.respond(p.reqId, { decision: decision ?? "decline" });
-      out({ event: "approval_resolved", threadId: this.threadId, requestId, decision: decision ?? "decline", timedOut: !decision });
+      this.emit({ event: "approval_resolved", threadId: this.threadId, requestId, decision: decision ?? "decline", timedOut: !decision });
     }
   }
 
@@ -160,7 +172,7 @@ export class Session {
     if (this.reconnecting) return;
     this.reconnecting = true;
     this.approvals.clear(); // 旧连接上的审批请求随连接失效
-    out({ event: "reconnecting", threadId: this.threadId });
+    this.emit({ event: "reconnecting", threadId: this.threadId });
     const giveUp = Date.now() + RECONNECT_GIVE_UP_MS;
     let delay = 1000;
     while (Date.now() < giveUp) {
@@ -170,7 +182,7 @@ export class Session {
         this.attach(c);
         await this.resume(c);
         this.reconnecting = false;
-        out({ event: "reconnected", threadId: this.threadId });
+        this.emit({ event: "reconnected", threadId: this.threadId });
         return;
       } catch {
         await sleep(delay);

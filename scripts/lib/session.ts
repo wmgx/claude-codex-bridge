@@ -3,7 +3,7 @@
 import { Client } from "./client";
 import { ensureDaemon } from "./daemon";
 import { out, sleep } from "./out";
-import { takeDecision } from "./state";
+import { takeDecision, writeLastEmitted } from "./state";
 
 const HEARTBEAT_MS = 30_000;
 const POLL_MS = 500;
@@ -35,12 +35,13 @@ export class Session {
   private activeTurnId?: string;
   private quietTimer?: ReturnType<typeof setTimeout>;
 
-  // baseline: undefined 表示"以挂上时线程已有的最后一个完成轮为起点，不重放历史"；
-  // null 表示线程是刚创建的，之后出现的任何完成轮都要上报。
+  // baseline: 最后一个已上报的完成轮，之后完成的轮次都要上报。
+  // null 表示还没上报过任何轮次（线程刚创建）；
+  // undefined 表示没有记录，以挂上时线程已有的最后一个完成轮为起点，不重放历史。
   //
   // quietMs: 最长静默时间，0 表示不限。Claude 每被唤醒一次（我们输出一个事件），它的 prompt 缓存有效期
-  // 就从头算；静默太久缓存会失效，下一次唤醒要按全价重读上下文。所以在缓存失效之前就中断 Codex
-  // 并上报，趁缓存还热时唤醒 Claude，由它问用户是否继续。
+  // 就从头算；静默太久缓存会失效，下一次唤醒要按全价重读上下文。所以在缓存失效之前输出一个
+  // heartbeat 事件把 Claude 唤醒一次，Codex 不受影响，继续跑。
   constructor(readonly threadId: string, private baseline?: string | null, private quietMs = 0) {
     if (baseline !== undefined) this.lastEmitted = baseline ?? undefined;
   }
@@ -57,16 +58,11 @@ export class Session {
     this.quietTimer = undefined;
     const turnId = this.activeTurnId;
     if (this.quietMs <= 0 || !turnId || this.approvals.size > 0) return;
-    this.quietTimer = setTimeout(() => void this.quietExceeded(turnId), this.quietMs);
-  }
-
-  private async quietExceeded(turnId: string) {
-    this.quietTimer = undefined;
-    this.activeTurnId = undefined; // 触发过就不再重复计时
-    let interrupted = true;
-    try { await this.client?.request("turn/interrupt", { threadId: this.threadId, turnId }); }
-    catch { interrupted = false; }
-    this.emit({ event: "quiet_timeout", threadId: this.threadId, turnId, minutes: this.quietMs / 60_000, interrupted });
+    // emit 会重新计时，所以这一轮没结束就会按间隔一直发下去。
+    this.quietTimer = setTimeout(
+      () => this.emit({ event: "heartbeat", threadId: this.threadId, turnId, quietMinutes: this.quietMs / 60_000 }),
+      this.quietMs,
+    );
   }
 
   private setActiveTurn(turnId?: string) {
@@ -87,16 +83,19 @@ export class Session {
     await c.request("thread/resume", { threadId: this.threadId, excludeTurns: true });
     const { thread } = await c.request("thread/read", { threadId: this.threadId, includeTurns: true });
     const running = (thread.turns ?? []).find((t: any) => t.status === "inProgress");
-    if (running) this.setActiveTurn(running.id);
+    this.setActiveTurn(running?.id); // 没有在跑的轮也要清掉，否则会对已结束的轮继续计时
     const done = (thread.turns ?? []).filter((t: any) => t.status !== "inProgress");
-    const last = done.at(-1);
     const firstAttach = !this.baselined;
     this.baselined = true;
     if (firstAttach && this.baseline === undefined) {
-      this.lastEmitted = last?.id;
-    } else if (last && last.id !== this.lastEmitted) {
-      this.emitTurn(last.id, last.status, reportOf(last));
+      this.lastEmitted = done.at(-1)?.id;
+      writeLastEmitted(this.threadId, this.lastEmitted ?? null);
+      return;
     }
+    // 补发上次上报之后完成的所有轮次；记录的那一轮找不到时只发最后一轮，避免重放整段历史。
+    const idx = done.findIndex((t: any) => t.id === this.lastEmitted);
+    const missed = idx >= 0 || !this.lastEmitted ? done.slice(idx + 1) : done.slice(-1);
+    for (const t of missed) this.emitTurn(t.id, t.status, reportOf(t));
   }
 
   run() {
@@ -106,6 +105,7 @@ export class Session {
 
   private emitTurn(turnId: string, status: string, text: string) {
     this.lastEmitted = turnId;
+    writeLastEmitted(this.threadId, turnId);
     this.emit({ event: "turn_completed", threadId: this.threadId, turnId, status, text });
   }
 
@@ -137,6 +137,7 @@ export class Session {
       return;
     }
     const requestId = String(m.id);
+    takeDecision(this.threadId, requestId); // 丢弃同 ID 的残留决定，避免旧的批准落到新请求上
     this.approvals.set(requestId, { reqId: m.id, deadline: Date.now() + APPROVAL_TIMEOUT_MS });
     this.emit({
       event: "approval_requested",

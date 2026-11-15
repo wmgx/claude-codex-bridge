@@ -9,8 +9,8 @@
 | 命令 | 作用 |
 |---|---|
 | `start <cwd> <text> [--name N] [--max-quiet M]` | 开线程，发第一轮，之后持续输出事件 |
-| `watch <thread> [--max-quiet M]` | 重新订阅已有线程的事件，不重放已上报的轮次 |
-| `send <thread> <text>` | 在同一线程继续发一轮 |
+| `watch <thread> [--max-quiet M]` | 重新订阅已有线程的事件；补发上次上报之后完成的轮次，已上报的不重放 |
+| `send <thread> <text>` | 在同一线程继续发一轮；没有监听进程时输出里会带 `watching: false` |
 | `approve <thread> <id> [--session]` / `deny <thread> <id>` | 回应审批请求 |
 | `list` | 列出 claude-codex-bridge 开过的线程 |
 | `history <thread> [--limit N]` | 最近几轮的提问与汇报 |
@@ -18,6 +18,10 @@
 | `doctor` | 检查依赖 |
 
 `<thread>` 可以是线程 ID，也可以是 `start` 时起的名字。线程在 Codex 自己的列表里显示为 `[bridge] <名字>`。
+
+`start` 和 `send` 的 `<text>` 可以换成 `--file <路径>`，从文件读文本。方案较长或带引号、反引号、`$` 时用它，避免 shell 转义出错。
+
+同一个线程同时只允许一个监听进程（`start` 或 `watch`）：已有一个在跑时，再 `watch` 会报错并给出它的 pid。
 
 ## 事件
 
@@ -29,7 +33,7 @@
 | `turn_completed` | 一轮结束，`text` 是 Codex 的最后一条消息（汇报或提问） |
 | `approval_requested` | Codex 请求越权操作，带 `requestId`、`command`、`reason` |
 | `approval_resolved` | 审批已落实（含超时自动拒绝） |
-| `quiet_timeout` | 太久没有唤醒 Claude，已中断 Codex；随后会有一条 `status: interrupted` 的 `turn_completed` |
+| `heartbeat` | 太久没有唤醒 Claude，发一个事件让它的缓存续期；Codex 不受影响，仍在跑 |
 | `reconnecting` / `reconnected` | 连接断开后自动重连 |
 | `error` / `closed` / `unsupported_request` | 出错、结束、收到不支持的请求 |
 
@@ -43,50 +47,83 @@ Codex 的提问发生在一轮末尾：它把问题写出来、结束这一轮�
 - 越出沙箱（如写家目录、联网）时，Codex 发出审批请求，变成 `approval_requested` 事件，**由用户决定**，Claude 不替用户批准。10 分钟无人回复自动拒绝。
 - 只读任务请在任务描述里写明"只读，不要改文件"。
 
-## 静默上限：避免 Claude 缓存过期导致成本飙升
+## 缓存心跳：避免 Claude 缓存过期
 
-Claude 每被唤醒一次，它的 prompt 缓存有效期就从头算（常见默认 5 分钟）。静默太久缓存会失效，下一个事件把它唤醒时要按全价重读整个上下文，成本飙升。
+Claude 每被唤醒一次，它的 prompt 缓存有效期就从头算。静默太久缓存会失效，下一个事件把它唤醒时要按全价重读整个上下文。
 
-`--max-quiet <分钟>` 控制最长静默时间，默认 4，`0` 表示不限，可以是小数：
+所以 Codex 的一轮跑得很久时，bridge 会在缓存失效之前输出一个 `heartbeat` 事件，把 Claude 唤醒一次让缓存续期。**心跳不中断 Codex，也不需要问用户**，Claude 收到后什么都不用做。
+
+`--max-quiet <分钟>` 控制最长静默时间，默认 50（按 1 小时缓存有效期留余量），`0` 表示不发心跳，可以是小数：
 
 - 每输出一个事件（即唤醒了 Claude），计时重置。
-- Codex 有一轮在跑、且静默达到上限时，**在缓存失效之前**中断这一轮并输出 `quiet_timeout`，趁缓存还热时唤醒 Claude，由它问用户"要继续吗"。
-- 用户同意后 `send <thread> "继续"`，开新的一轮重新计时；不同意就到此为止。
+- Codex 有一轮在跑、且静默达到上限时，输出一个 `heartbeat`，然后重新计时；这一轮没结束就按这个间隔一直发。
+- 没有轮次在跑时不发。
 - 等审批期间不计入：那时 Claude 已经在等用户，不是静默。
 
-说明：插件看不到 Claude 自己的缓存状态，所以上限要由使用者按自己会话的缓存有效期设置。如果会话缓存有效期是 1 小时，可以设成 50 左右，减少不必要的中断。
+说明：
+
+- 插件看不到 Claude 自己的缓存状态，上限要按自己会话的缓存有效期设置。缓存有效期是 5 分钟的会话设成 4 左右。
+- 每次心跳也要付一次读缓存的钱。间隔很短、任务很长时，心跳的总花费可能超过让缓存过期一次，这种情况用 `--max-quiet 0` 关掉更划算。
+- 计时器在监听进程里。Monitor 最长 30 分钟，所以默认的 50 分钟在单个 Monitor 内不会触发；Monitor 到期、Claude 重新 `watch` 本身就是一次唤醒。
 
 ## 保活
 
 - 连接断开自动重连（指数退避，最长 15 秒一次，10 分钟放弃）。
-- 每 30 秒心跳，连接静默死掉也能发现。
-- 重连后补发断线期间完成、但还没上报的轮次，不重复上报。
+- 每 30 秒探活一次，连接静默死掉也能发现。
+- 最后上报到哪一轮记在状态目录里。重连或重新 `watch` 后，补发这之后完成的所有轮次，不重复上报。
 - 重连会使旧连接上未决的审批请求失效，需要 Codex 重新发起。
-
-## 要求
-
-- [Bun](https://bun.sh) >= 1.4（需要 `ws+unix://` 支持）
-- Codex CLI，已登录。脚本会自动启动本地 daemon（`codex app-server daemon start`），不开远程控制。
 
 ## 安装
 
-在 Claude Code 里添加本仓库为插件市场并安装：
+**1. 准备依赖**
+
+- [Bun](https://bun.sh) >= 1.4（需要 `ws+unix://` 支持）。已装的用 `bun upgrade` 升级。
+- Codex CLI，并已登录（`codex login`）。
+
+**2. 安装插件**
+
+在 Claude Code 里添加本仓库为插件市场并安装，然后重启 Claude Code：
 
 ```
 /plugin marketplace add wmgx/claude-codex-bridge
 /plugin install claude-codex-bridge
 ```
 
-首次使用前自检：`bun scripts/bridge.ts doctor`。
+**3. 自检**
+
+对 Claude 说"自检一下 Codex bridge"，它会运行 `doctor` 检查 Bun 版本、Codex CLI 和 daemon 是否可连接。克隆了仓库的话也可以直接跑 `bun scripts/bridge.ts doctor`。
+
+脚本会在需要时自动启动 Codex 的本地 daemon（`codex app-server daemon start`），不开远程控制。daemon 是常驻进程，不用时可以 `codex app-server daemon stop` 停掉。
+
+**升级与卸载**
+
+- 升级：在 `/plugin` 界面里更新插件市场和插件，然后重启 Claude Code。
+- 卸载：`/plugin uninstall claude-codex-bridge`。状态文件在 `~/.local/state/claude-codex-bridge/`，不再需要可以直接删除。
+- 从 0.2 升级：`quiet_timeout` 事件已改为 `heartbeat`，静默到上限时不再中断 Codex；`--max-quiet` 默认值从 4 改为 50 分钟。
 
 ## 使用
 
 对 Claude 说"让 Codex 去做 X"。`delegate` skill 会引导 Claude：先和你确认方案，再用 `Monitor` 运行 `bridge.ts start`，收到事件后核对结果、回答提问、把审批请求转给你。
 
+## 旁观 Codex 在做什么
+
+bridge 开的是 Codex 本地 daemon 上的普通线程，可以用 Codex 自己的客户端连上去看：
+
+- `codex agents`：浏览 daemon 上的所有会话，bridge 开的显示为 `[bridge] <名字>`。
+- `codex resume <线程ID或名字> --remote unix://`：把 Codex 终端界面连到同一个 daemon，实时看它在跑什么命令、改什么文件。
+
+注意：
+
+- 一定带 `--remote unix://`。不带的话可能另起一个进程加载同一个线程，两边各跑各的。
+- 只看，不要在旁观窗口里发消息，否则 Claude 会收到一轮不是它发起的 `turn_completed`。
+- 审批回到 Claude 这边批。在旁观窗口里直接批的话，bridge 不知道，10 分钟后会误报一条"超时自动拒绝"。
+
 ## 安全
 
 - 只连本机 Unix socket，不联网、不读写凭据。
-- 审批决定以文件形式落在 `~/.local/state/claude-codex-bridge/`（目录 0700、文件 0600），由监听进程读取后删除。
+- **批准必须经用户确认**：插件带一个 `PreToolUse` hook（`hooks/hooks.json`），Claude 执行 `bridge.ts approve` 时强制弹出确认，不受已有的 Bash 放行规则影响。`deny` 不拦。它识别的是命令文本，是一道防线而不是沙箱；不通过插件安装、直接跑脚本时没有这层保护。
+- 状态落在 `~/.local/state/claude-codex-bridge/<线程>/`（目录 0700、文件 0600）：审批决定（监听进程读取后删除）、最后上报的轮次、监听进程的 pid。
+- 新的审批请求登记时会先丢弃同 ID 的残留决定，过期的批准不会落到别的请求上。
 - Codex 的汇报是它的自述，Claude 应自己核对 diff 和测试，不要直接采信。
 
 ## 已知限制
@@ -94,7 +131,7 @@ Claude 每被唤醒一次，它的 prompt 缓存有效期就从头算（常见�
 - 依赖 Codex 实验性的 app-server 协议。Codex 升级后可能失效；已测 Codex CLI 0.166.0 / daemon 0.167.0。
 - 只处理命令执行和文件变更两类审批；其他请求（工具调用、权限请求、用户输入）会被自动拒绝并输出 `unsupported_request`。
 - Monitor 最长 30 分钟，长任务到期后用 `watch` 续上。
-- 没有单元测试，验证靠对真实 Codex 的端到端运行（提问往返、审批、断线重连、列表与历史）。
+- 单元测试只有两个（`bun test`）：重新 `watch` 后的补发、残留审批决定不会错批。其余靠对真实 Codex 的端到端运行验证（提问往返、心跳、审批、重新监听补发、列表与历史）。
 
 ## License
 

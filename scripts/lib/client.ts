@@ -25,7 +25,7 @@ export class Client {
       ws.onopen = () => { clearTimeout(timer); resolve(); };
       ws.onerror = () => { clearTimeout(timer); reject(new BridgeError("连接 daemon 失败")); };
     });
-    await c.request("initialize", { clientInfo: { name: "claude-codex-bridge", version: "0.2.0" }, capabilities: { experimentalApi: true } });
+    await c.request("initialize", { clientInfo: { name: "claude-codex-bridge", version: "0.3.0" }, capabilities: { experimentalApi: true } });
     ws.send(JSON.stringify({ method: "initialized" }));
     return c;
   }

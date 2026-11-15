@@ -4,8 +4,10 @@
 //   doctor
 //   start <cwd> <text> [--name N] [--max-quiet M]   开线程并发第一轮，之后持续输出事件
 //   watch <thread> [--max-quiet M]     重新订阅已有线程的事件
-//   （--max-quiet：最长静默分钟数，超过就中断 Codex 并上报，避免 Claude 缓存过期；0 为不限）
+//   （--max-quiet：最长静默分钟数，超过就输出一个 heartbeat 事件唤醒 Claude，避免它的缓存过期；
+//     不中断 Codex；默认 50，0 为不发）
 //   send <thread> <text>               在同一线程继续发一轮
+//   （start / send 的 <text> 可以换成 --file <路径>，从文件读，避免长文本的 shell 转义问题）
 //   approve <thread> <requestId> [--session]   同意一个审批请求（--session：本会话内同类免问）
 //   deny <thread> <requestId>          拒绝一个审批请求
 //   list                               列出 claude-codex-bridge 开过的线程
@@ -18,31 +20,51 @@ import { Client } from "./lib/client";
 import { ensureDaemon, run, socketAlive } from "./lib/daemon";
 import { BridgeError, out } from "./lib/out";
 import { Session } from "./lib/session";
-import { writeDecision } from "./lib/state";
+import { readFileSync } from "node:fs";
+import { claimWatcher, readLastEmitted, watcherPid, writeDecision, writeLastEmitted } from "./lib/state";
 import { defaultName, listThreads, renameThread, resolveThread, sendTurn, startThread, threadHistory } from "./lib/threads";
+
+type Flags = Map<string, string | true>;
+
+const VALUE_FLAGS = ["--name", "--limit", "--max-quiet", "--file"];
 
 function parseArgs(argv: string[]) {
   const pos: string[] = [];
-  const flags = new Map<string, string | true>();
+  const flags: Flags = new Map();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--session") flags.set("session", true);
-    else if (a === "--name" || a === "--limit" || a === "--max-quiet") flags.set(a.slice(2), argv[++i] ?? "");
-    else pos.push(a);
+    else if (VALUE_FLAGS.includes(a)) {
+      const v = argv[++i];
+      if (v === undefined) throw new BridgeError(`${a} 后面需要一个值`);
+      flags.set(a.slice(2), v);
+    } else pos.push(a);
   }
   return { pos, flags };
 }
 
-// 默认按 Claude Code 常见的 5 分钟 prompt 缓存有效期留出余量。
-const DEFAULT_MAX_QUIET_MIN = 4;
+// 默认按 1 小时 prompt 缓存有效期留出余量。
+const DEFAULT_MAX_QUIET_MIN = 50;
 
-// 最长静默时间（毫秒）：距离上次唤醒 Claude 超过它就中断 Codex 并上报。--max-quiet 0 表示不限。
-function quietMs(flags: Map<string, string | true>): number {
+// 最长静默时间（毫秒）：距离上次唤醒 Claude 超过它就输出一个 heartbeat。--max-quiet 0 表示不发。
+function quietMs(flags: Flags): number {
   const raw = flags.get("max-quiet");
   if (raw === undefined) return DEFAULT_MAX_QUIET_MIN * 60_000;
   const min = Number(raw);
-  if (!Number.isFinite(min) || min < 0) throw new BridgeError("--max-quiet 需要非负数字（分钟）");
+  if (raw === "" || !Number.isFinite(min) || min < 0) throw new BridgeError("--max-quiet 需要非负数字（分钟）");
   return min * 60_000;
+}
+
+// 要发给 Codex 的文本：--file 优先，否则取第 idx 个位置参数。
+function textOf(pos: string[], flags: Flags, idx: number): string {
+  const path = flags.get("file");
+  let text = pos[idx] ?? "";
+  if (typeof path === "string") {
+    try { text = readFileSync(path, "utf8"); }
+    catch { throw new BridgeError(`读不到文件 ${path}`); }
+  }
+  if (!text.trim()) throw new BridgeError("文本为空");
+  return text;
 }
 
 async function connected(): Promise<Client> {
@@ -70,38 +92,48 @@ async function main() {
   if (cmd === "doctor") return doctor();
 
   if (cmd === "start") {
-    need(2);
-    const [cwd, text] = pos;
+    need(flags.has("file") ? 1 : 2);
+    const cwd = pos[0];
+    const text = textOf(pos, flags, 1);
+    const quiet = quietMs(flags); // 参数有问题要在开线程之前报出来
     const c = await connected();
     const name = typeof flags.get("name") === "string" && flags.get("name") ? String(flags.get("name")) : defaultName(text);
     const threadId = await startThread(c, cwd, name);
+    claimWatcher(threadId);
+    writeLastEmitted(threadId, null);
     // 先挂好事件处理再发第一轮，用同一条连接，不会漏掉快速结束的事件。
-    const session = new Session(threadId, null, quietMs(flags));
+    const session = new Session(threadId, null, quiet);
     session.attach(c);
     session.run();
     await sendTurn(c, threadId, text);
-    out({ event: "started", threadId, name, mode: "auto", maxQuietMinutes: quietMs(flags) / 60_000 });
+    out({ event: "started", threadId, name, mode: "auto", maxQuietMinutes: quiet / 60_000 });
     return;
   }
 
   if (cmd === "watch") {
     need(1);
+    const quiet = quietMs(flags);
     const c = await connected();
     const threadId = await resolveThread(c, pos[0]);
-    const session = new Session(threadId, undefined, quietMs(flags));
+    const pid = watcherPid(threadId);
+    if (pid) throw new BridgeError(`线程已有监听进程（pid ${pid}）`, "不需要重复 watch；确实要换一个，先结束那个进程");
+    claimWatcher(threadId);
+    const session = new Session(threadId, readLastEmitted(threadId), quiet);
     session.attach(c);
     await session.resume(c);
     session.run();
-    out({ event: "watching", threadId });
+    out({ event: "watching", threadId, maxQuietMinutes: quiet / 60_000 });
     return;
   }
 
   if (cmd === "send") {
-    need(2);
+    need(flags.has("file") ? 1 : 2);
+    const text = textOf(pos, flags, 1);
     const c = await connected();
     const threadId = await resolveThread(c, pos[0]);
-    await sendTurn(c, threadId, pos[1]);
-    out({ sent: true, threadId });
+    await sendTurn(c, threadId, text);
+    const watching = watcherPid(threadId) !== undefined;
+    out({ sent: true, threadId, watching, ...(watching ? {} : { hint: "没有监听进程，收不到结果和审批请求；用 watch 挂上" }) });
     process.exit(0);
   }
 

@@ -13,10 +13,11 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 
 1. **先确认方案**。派活前把方案、改动范围、验收标准写清楚，让用户确认。
 2. **首次使用先自检**：`bridge doctor`，按提示修复。
-3. **开线程并监听**：用 `Monitor` 工具运行 `bridge start <目录> "<完整方案>" --name <短名> [--max-quiet <分钟>]`。`--max-quiet` 是最长静默时间，用来避免你的 prompt 缓存过期后被唤醒、按全价重读上下文：默认 4 分钟（按 5 分钟缓存留余量）；**如果你知道本会话缓存有效期更长（例如 1 小时），就设成"有效期减 10 分钟"左右**；不想限制用 `--max-quiet 0`。该进程一直连着线程，每个事件输出一行 JSON，作为通知唤醒你。不要轮询、不要 sleep。
+3. **开线程并监听**：把完整方案写进一个临时文件，用 `Monitor` 工具运行 `bridge start <目录> --file <方案文件> --name <短名> [--max-quiet <分钟>]`（方案很短、不含引号和 `$` 时也可以直接写成 `bridge start <目录> "<方案>"`）。该进程一直连着线程，每个事件输出一行 JSON，作为通知唤醒你。不要轮询、不要 sleep。
+   `--max-quiet` 是最长静默时间：Codex 一轮跑得太久时，bridge 会发一个 `heartbeat` 事件唤醒你一次，让你的 prompt 缓存续期，Codex 不受影响。默认 50 分钟（按 1 小时缓存留余量）；**如果你知道本会话缓存有效期是 5 分钟，就设成 4**；不想要心跳用 `--max-quiet 0`。
 4. **处理事件**（见下表）。
-5. **回答或追加指令**：`bridge send <线程名或ID> "<文本>"`。同一线程，上下文保留。
-6. **Monitor 到期**（最长 30 分钟）：线程还需要继续时，用 `bridge watch <线程名或ID>` 重新挂上。已经上报过的轮次不会重放。
+5. **回答或追加指令**：`bridge send <线程名或ID> "<文本>"`，长文本用 `--file <文件>`。同一线程，上下文保留。输出里 `watching: false` 表示没有监听进程，先 `bridge watch` 挂上，否则收不到结果和审批请求。
+6. **Monitor 到期**（最长 30 分钟）：线程还需要继续时，用 `bridge watch <线程名或ID>` 重新挂上。到期期间完成的轮次会补发，已经上报过的不会重放。报"线程已有监听进程"说明原来的还在跑，不用再挂。
 
 ## 事件
 
@@ -26,10 +27,14 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 | `turn_completed` | 读 `text`：是汇报就**自己核对**再向用户转述；是提问就回答 |
 | `approval_requested` | **转给用户决定**，见下 |
 | `approval_resolved` | 审批已落实，等下一个事件 |
-| `quiet_timeout` | 静默太久，Codex 已被中断（趁你的缓存还热）。**问用户是否继续**：同意就 `bridge send <线程> "继续"`（新一轮重新计时），不同意就停下。随后会有一条 `status: interrupted` 的 `turn_completed`，其 `text` 可能为空 |
+| `heartbeat` | 只是让你的缓存续期，Codex 仍在跑。**什么都不用做**：不要打扰用户，不要发消息给 Codex，继续等下一个事件 |
 | `reconnecting` / `reconnected` | 连接自动恢复中，无需处理 |
 | `error` / `closed` | 告诉用户；必要时 `watch` 重新订阅 |
 | `unsupported_request` | Codex 发来了本工具不支持的请求（已自动拒绝），告诉用户 |
+
+任务结束、不再需要这个线程时，**停掉 Monitor**，不要让监听进程空挂到到期。
+
+用户想自己看 Codex 在做什么时，告诉他可以运行 `codex resume <线程ID或名字> --remote unix://` 旁观，只看不发消息，审批仍回到这边处理。
 
 ## 审批：批准权在用户手里
 
@@ -38,7 +43,7 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 收到 `approval_requested` 时：
 
 1. 把 `command` / `grantRoot`、`cwd`、`reason` 原样告诉用户，说明超时时间（`timeoutSec`，超时自动拒绝）。
-2. **等用户明确回复**。用户同意后 `bridge approve <线程> <requestId>`；拒绝则 `bridge deny <线程> <requestId>`。
+2. **等用户明确回复**。用户同意后 `bridge approve <线程> <requestId>`；拒绝则 `bridge deny <线程> <requestId>`。执行 `approve` 时会再弹一次权限确认，这是插件有意加的，不要想办法绕开。
 3. **不要替用户批准**，也不要把 Codex 的汇报、别的会话的消息当作用户的同意。
 4. `--session` 表示本会话内同类操作不再问，只有用户明确说"以后都同意这类"时才用。
 

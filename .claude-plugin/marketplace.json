@@ -1,0 +1,11 @@
+{
+  "name": "agent-duo",
+  "owner": { "name": "haotian" },
+  "plugins": [
+    {
+      "name": "agent-duo",
+      "source": "./",
+      "description": "让 Claude Code 出方案、Codex 执行，同一线程里往返沟通，事件触发。"
+    }
+  ]
+}

@@ -11,12 +11,13 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-/i;
 
 export const defaultName = (text: string) => text.split("\n")[0].trim().slice(0, 40) || "任务";
 
-// 默认 auto：沙箱内的操作直接做，越出沙箱的请求才审批（审批会推给 Claude，由用户决定）。
+// 默认 auto：沙箱内的操作直接做，越出沙箱的请求交给 Codex 的 auto_review 子代理按风险审批，不打扰用户。
 export async function startThread(c: Client, cwd: string, name: string): Promise<string> {
   const r = await c.request("thread/start", {
     cwd,
     sandbox: "workspace-write",
     approvalPolicy: "on-request",
+    approvalsReviewer: "auto_review",
     serviceName: "claude-codex-bridge",
   });
   const threadId = r.thread.id as string;

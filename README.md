@@ -43,10 +43,11 @@ Codex 的提问发生在一轮末尾：它把问题写出来、结束这一轮�
 
 ## 权限：auto 模式
 
-线程固定为 Codex 的 auto 模式（`workspace-write` 沙箱 + `on-request` 审批）：
+线程固定为 Codex 的 auto 模式（`workspace-write` 沙箱 + `on-request` 审批 + `auto_review` 审查者）：
 
 - 沙箱内（线程工作目录、系统临时目录）的操作 Codex 直接做，不打扰。
-- 越出沙箱（如写家目录、联网）时，Codex 发出审批请求，变成 `approval_requested` 事件，**由用户决定**，Claude 不替用户批准。10 分钟无人回复自动拒绝。
+- 越出沙箱（如写家目录、联网）时，审批请求默认交给 Codex 的 `auto_review` 子代理按风险判断，通过或拒绝都不打扰用户。
+- 仍落到用户这边的请求（如审查者无法决定）会变成 `approval_requested` 事件，**由用户决定**，Claude 不替用户批准。10 分钟无人回复自动拒绝。
 - 只读任务请在任务描述里写明"只读，不要改文件"。
 
 ## 缓存心跳：避免 Claude 缓存过期

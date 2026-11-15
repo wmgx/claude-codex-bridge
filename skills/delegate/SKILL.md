@@ -38,7 +38,7 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 
 ## 审批：批准权在用户手里
 
-线程是 auto 模式：沙箱内的操作 Codex 直接做；越出沙箱（写工作目录和 `/tmp` 之外、联网等）时，它会请求审批。
+线程是 auto 模式：沙箱内的操作 Codex 直接做；越出沙箱（写工作目录和 `/tmp` 之外、联网等）时，默认由 Codex 的 `auto_review` 子代理自动审批；只有仍转给用户的请求才会出现 `approval_requested`。
 
 收到 `approval_requested` 时：
 

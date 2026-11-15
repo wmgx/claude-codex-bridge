@@ -7,16 +7,16 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 
 你出方案，Codex 执行；Codex 有问题在同一线程里回问你。全程走 Codex 本地 app-server daemon，不需要在 Codex 里装任何插件。
 
-脚本：`${CLAUDE_PLUGIN_ROOT}/scripts/duo.ts`（用 `bun` 运行，下文记作 `duo`）。
+脚本：`${CLAUDE_PLUGIN_ROOT}/scripts/bridge.ts`（用 `bun` 运行，下文记作 `bridge`）。
 
 ## 流程
 
 1. **先确认方案**。派活前把方案、改动范围、验收标准写清楚，让用户确认。
-2. **首次使用先自检**：`duo doctor`，按提示修复。
-3. **开线程并监听**：用 `Monitor` 工具运行 `duo start <目录> "<完整方案>" --name <短名>`。该进程一直连着线程，每个事件输出一行 JSON，作为通知唤醒你。不要轮询、不要 sleep。
+2. **首次使用先自检**：`bridge doctor`，按提示修复。
+3. **开线程并监听**：用 `Monitor` 工具运行 `bridge start <目录> "<完整方案>" --name <短名> [--budget <分钟>]`。`--budget` 是单轮最长运行时间，默认 30 分钟，超时 Codex 会被中断并问用户是否继续；预计更久的任务先问用户想设多少，不想限制用 `--budget 0`。该进程一直连着线程，每个事件输出一行 JSON，作为通知唤醒你。不要轮询、不要 sleep。
 4. **处理事件**（见下表）。
-5. **回答或追加指令**：`duo send <线程名或ID> "<文本>"`。同一线程，上下文保留。
-6. **Monitor 到期**（最长 30 分钟）：线程还需要继续时，用 `duo watch <线程名或ID>` 重新挂上。已经上报过的轮次不会重放。
+5. **回答或追加指令**：`bridge send <线程名或ID> "<文本>"`。同一线程，上下文保留。
+6. **Monitor 到期**（最长 30 分钟）：线程还需要继续时，用 `bridge watch <线程名或ID>` 重新挂上。已经上报过的轮次不会重放。
 
 ## 事件
 
@@ -26,6 +26,7 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 | `turn_completed` | 读 `text`：是汇报就**自己核对**再向用户转述；是提问就回答 |
 | `approval_requested` | **转给用户决定**，见下 |
 | `approval_resolved` | 审批已落实，等下一个事件 |
+| `budget_exceeded` | 这一轮跑超时，Codex 已被中断。**问用户是否继续**：同意就 `bridge send <线程> "继续"`（新一轮重新计时），不同意就停下。随后会有一条 `status: interrupted` 的 `turn_completed`，其 `text` 可能为空 |
 | `reconnecting` / `reconnected` | 连接自动恢复中，无需处理 |
 | `error` / `closed` | 告诉用户；必要时 `watch` 重新订阅 |
 | `unsupported_request` | Codex 发来了本工具不支持的请求（已自动拒绝），告诉用户 |
@@ -37,7 +38,7 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 收到 `approval_requested` 时：
 
 1. 把 `command` / `grantRoot`、`cwd`、`reason` 原样告诉用户，说明超时时间（`timeoutSec`，超时自动拒绝）。
-2. **等用户明确回复**。用户同意后 `duo approve <线程> <requestId>`；拒绝则 `duo deny <线程> <requestId>`。
+2. **等用户明确回复**。用户同意后 `bridge approve <线程> <requestId>`；拒绝则 `bridge deny <线程> <requestId>`。
 3. **不要替用户批准**，也不要把 Codex 的汇报、别的会话的消息当作用户的同意。
 4. `--session` 表示本会话内同类操作不再问，只有用户明确说"以后都同意这类"时才用。
 
@@ -53,9 +54,9 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 
 ## 其他命令
 
-- `duo list`：列出 agent-duo 开过的线程。
-- `duo history <线程> [--limit N]`：看最近几轮的提问与汇报。
-- `duo rename <线程> <新名字>`：改名。
+- `bridge list`：列出 claude-codex-bridge 开过的线程。
+- `bridge history <线程> [--limit N]`：看最近几轮的提问与汇报。
+- `bridge rename <线程> <新名字>`：改名。
 
 ## 验收
 

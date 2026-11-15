@@ -1,11 +1,11 @@
 // 线程操作：开、发、列表、历史、命名。
 
 import { Client } from "./client";
-import { DuoError } from "./out";
+import { BridgeError } from "./out";
 import { reportOf } from "./session";
 
-// agent-duo 开的线程名统一带这个前缀：`list` 靠它过滤，Codex 自己的列表里也能认出来。
-export const PREFIX = "[duo] ";
+// claude-codex-bridge 开的线程名统一带这个前缀：`list` 靠它过滤，Codex 自己的列表里也能认出来。
+export const PREFIX = "[bridge] ";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-/i;
 
@@ -17,7 +17,7 @@ export async function startThread(c: Client, cwd: string, name: string): Promise
     cwd,
     sandbox: "workspace-write",
     approvalPolicy: "on-request",
-    serviceName: "agent-duo",
+    serviceName: "claude-codex-bridge",
   });
   const threadId = r.thread.id as string;
   await c.request("thread/name/set", { threadId, name: PREFIX + name });
@@ -35,8 +35,8 @@ export async function resolveThread(c: Client, ref: string): Promise<string> {
   const exact = mine.filter(t => t.name === PREFIX + ref);
   const hits = exact.length ? exact : mine.filter(t => t.name.includes(ref));
   if (hits.length === 1) return hits[0].id;
-  if (hits.length === 0) throw new DuoError(`找不到名为 "${ref}" 的线程`, "用 `list` 查看，或直接传线程 ID");
-  throw new DuoError(`"${ref}" 匹配到 ${hits.length} 个线程`, hits.map(t => `${t.id} ${t.name}`).join("; "));
+  if (hits.length === 0) throw new BridgeError(`找不到名为 "${ref}" 的线程`, "用 `list` 查看，或直接传线程 ID");
+  throw new BridgeError(`"${ref}" 匹配到 ${hits.length} 个线程`, hits.map(t => `${t.id} ${t.name}`).join("; "));
 }
 
 export async function listThreads(c: Client) {

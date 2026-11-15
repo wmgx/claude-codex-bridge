@@ -3,7 +3,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { DuoError } from "./out";
+import { BridgeError } from "./out";
 
 export const SOCK = join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "app-server-control", "app-server-control.sock");
 
@@ -28,7 +28,7 @@ export function socketAlive(): Promise<boolean> {
 
 export async function ensureDaemon(): Promise<void> {
   if (await socketAlive()) return;
-  if (!run(["codex", "--version"]).ok) throw new DuoError("找不到 codex 命令", "先安装 Codex CLI 并登录");
+  if (!run(["codex", "--version"]).ok) throw new BridgeError("找不到 codex 命令", "先安装 Codex CLI 并登录");
   run(["codex", "app-server", "daemon", "start"]);
-  if (!(await socketAlive())) throw new DuoError("Codex daemon 启动失败", "手动运行 `codex app-server daemon start` 查看错误");
+  if (!(await socketAlive())) throw new BridgeError("Codex daemon 启动失败", "手动运行 `codex app-server daemon start` 查看错误");
 }

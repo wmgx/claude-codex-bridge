@@ -1,5 +1,5 @@
 {
-  "name": "agent-duo",
+  "name": "claude-codex-bridge",
   "version": "0.2.0",
   "description": "让 Claude Code 出方案、Codex 执行：直接开线程、派活、事件触发收结果，Codex 有问题在同一线程里回问。",
   "author": {

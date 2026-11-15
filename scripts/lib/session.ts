@@ -32,11 +32,34 @@ export class Session {
   private reconnecting = false;
   private baselined = false;
   private timers: ReturnType<typeof setInterval>[] = [];
+  private budgetTimer?: ReturnType<typeof setTimeout>;
 
   // baseline: undefined 表示"以挂上时线程已有的最后一个完成轮为起点，不重放历史"；
   // null 表示线程是刚创建的，之后出现的任何完成轮都要上报。
-  constructor(readonly threadId: string, private baseline?: string | null) {
+  // budgetMs: 单轮最长运行时间，超时就中断这一轮并上报，由 Claude 问用户是否继续；0 表示不限。
+  constructor(readonly threadId: string, private baseline?: string | null, private budgetMs = 0) {
     if (baseline !== undefined) this.lastEmitted = baseline ?? undefined;
+  }
+
+  // 给一个正在运行的轮次计时。startedAtSec 用于重连后扣除已经跑过的时间。
+  private armBudget(turnId: string, startedAtSec?: number | null) {
+    this.clearBudget();
+    if (this.budgetMs <= 0) return;
+    const elapsed = startedAtSec ? Date.now() - startedAtSec * 1000 : 0;
+    this.budgetTimer = setTimeout(() => void this.budgetExceeded(turnId), Math.max(this.budgetMs - elapsed, 0));
+  }
+
+  private clearBudget() {
+    if (this.budgetTimer) clearTimeout(this.budgetTimer);
+    this.budgetTimer = undefined;
+  }
+
+  private async budgetExceeded(turnId: string) {
+    this.budgetTimer = undefined;
+    let interrupted = true;
+    try { await this.client?.request("turn/interrupt", { threadId: this.threadId, turnId }); }
+    catch { interrupted = false; }
+    out({ event: "budget_exceeded", threadId: this.threadId, turnId, minutes: this.budgetMs / 60_000, interrupted });
   }
 
   // 接管一条已建立的连接（start 用同一条连接开线程，避免漏事件）。
@@ -51,6 +74,8 @@ export class Session {
   async resume(c: Client) {
     await c.request("thread/resume", { threadId: this.threadId, excludeTurns: true });
     const { thread } = await c.request("thread/read", { threadId: this.threadId, includeTurns: true });
+    const running = (thread.turns ?? []).find((t: any) => t.status === "inProgress");
+    if (running) this.armBudget(running.id, running.startedAt);
     const done = (thread.turns ?? []).filter((t: any) => t.status !== "inProgress");
     const last = done.at(-1);
     const firstAttach = !this.baselined;
@@ -79,7 +104,10 @@ export class Session {
       const final = item.phase === "final_answer";
       const prev = this.texts.get(turnId);
       if (final || !prev?.final) this.texts.set(turnId, { text: item.text ?? "", final });
+    } else if (m.method === "turn/started") {
+      this.armBudget(m.params.turn.id, m.params.turn.startedAt);
     } else if (m.method === "turn/completed") {
+      this.clearBudget();
       const t = m.params.turn;
       const text = this.texts.get(t.id)?.text ?? reportOf(t);
       this.texts.delete(t.id);
@@ -92,7 +120,7 @@ export class Session {
   private onServerRequest(m: any) {
     const kind = APPROVAL_KIND[m.method];
     if (!kind) {
-      this.client?.respondError(m.id, "agent-duo 不支持这类请求");
+      this.client?.respondError(m.id, "claude-codex-bridge 不支持这类请求");
       out({ event: "unsupported_request", threadId: this.threadId, method: m.method });
       return;
     }

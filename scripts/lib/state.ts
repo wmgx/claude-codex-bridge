@@ -6,7 +6,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const BASE = join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"), "agent-duo");
+const BASE = join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"), "claude-codex-bridge");
 
 export type Decision = "accept" | "acceptForSession" | "decline";
 

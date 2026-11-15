@@ -68,10 +68,10 @@ Codex 的提问发生在一轮末尾：它把问题写出来、结束这一轮�
 
 ## 安装
 
-在 Claude Code 里添加本仓库为插件市场并安装（填入你的仓库地址）：
+在 Claude Code 里添加本仓库为插件市场并安装：
 
 ```
-/plugin marketplace add <owner>/claude-codex-bridge
+/plugin marketplace add wmgx/claude-codex-bridge
 /plugin install claude-codex-bridge
 ```
 

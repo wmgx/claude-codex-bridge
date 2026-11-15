@@ -11,5 +11,6 @@
     "codex",
     "delegation",
     "multi-agent"
-  ]
+  ],
+  "repository": "https://github.com/wmgx/claude-codex-bridge"
 }

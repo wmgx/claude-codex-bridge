@@ -67,3 +67,16 @@ export function watcherPid(threadId: string): number | undefined {
     return undefined;
   }
 }
+
+// 监听进程每次探活后写一份：Claude 随时能用 `status` 查到 Codex 是否还活着，不必等事件。
+export type Status = { pid: number; updatedAt: string; daemon: "up" | "reconnecting" | "down"; thread?: string; activeTurnId?: string };
+
+const statusFile = (threadId: string) => join(dir(threadId), "status.json");
+
+export function writeStatus(threadId: string, s: Omit<Status, "pid" | "updatedAt">) {
+  write(threadId, statusFile(threadId), JSON.stringify({ pid: process.pid, updatedAt: new Date().toISOString(), ...s }));
+}
+
+export function readStatus(threadId: string): Status | undefined {
+  try { return JSON.parse(readFileSync(statusFile(threadId), "utf8")); } catch { return undefined; }
+}

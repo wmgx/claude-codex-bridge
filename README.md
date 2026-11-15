@@ -12,6 +12,7 @@
 | `watch <thread> [--max-quiet M]` | 重新订阅已有线程的事件；补发上次上报之后完成的轮次，已上报的不重放 |
 | `send <thread> <text>` | 在同一线程继续发一轮；没有监听进程时输出里会带 `watching: false` |
 | `approve <thread> <id> [--session]` / `deny <thread> <id>` | 回应审批请求 |
+| `status <thread>` | 查 Codex 是否还活着：返回 `ok`、`problems`、`daemon`、`thread` 状态、`running`、监听进程 pid。只读，不会拉起 daemon |
 | `list` | 列出 claude-codex-bridge 开过的线程 |
 | `history <thread> [--limit N]` | 最近几轮的提问与汇报 |
 | `rename <thread> <name>` | 改名 |
@@ -34,6 +35,7 @@
 | `approval_requested` | Codex 请求越权操作，带 `requestId`、`command`、`reason` |
 | `approval_resolved` | 审批超时，已自动拒绝。正常的批准或拒绝不上报 |
 | `heartbeat` | 太久没有唤醒 Claude，发一个事件让它的缓存续期；Codex 不受影响，仍在跑 |
+| `codex_lost` | 一轮正在跑时 Codex 异常退出（没有先发 `thread/closed` 就被卸载，或进入 systemError），不会再有结果。Codex 自己正常卸载线程不推送。带 `turnId`、`status` |
 | `approvals_dropped` | 连接断开重连后，旧连接上未决的审批请求失效，带 `requestIds` |
 | `error` / `closed` / `unsupported_request` | 出错、结束、收到不支持的请求 |
 

@@ -3,7 +3,7 @@
 import { Client } from "./client";
 import { ensureDaemon } from "./daemon";
 import { out, sleep } from "./out";
-import { takeDecision, writeLastEmitted } from "./state";
+import { takeDecision, writeLastEmitted, writeStatus } from "./state";
 
 const HEARTBEAT_MS = 30_000;
 const POLL_MS = 500;
@@ -33,6 +33,7 @@ export class Session {
   private baselined = false;
   private timers: ReturnType<typeof setInterval>[] = [];
   private activeTurnId?: string;
+  private crashedTurn?: string; // 断线时正在跑的轮次；重连后它若没正常完成，就是 Codex 崩了
   private quietTimer?: ReturnType<typeof setTimeout>;
 
   // baseline: 最后一个已上报的完成轮，之后完成的轮次都要上报。
@@ -95,7 +96,11 @@ export class Session {
     // 补发上次上报之后完成的所有轮次；记录的那一轮找不到时只发最后一轮，避免重放整段历史。
     const idx = done.findIndex((t: any) => t.id === this.lastEmitted);
     const missed = idx >= 0 || !this.lastEmitted ? done.slice(idx + 1) : done.slice(-1);
-    for (const t of missed) this.emitTurn(t.id, t.status, reportOf(t));
+    for (const t of missed) {
+      if (t.id === this.crashedTurn && t.status !== "completed") this.emitLost(t.id, t.status, reportOf(t));
+      else this.emitTurn(t.id, t.status, reportOf(t));
+    }
+    this.crashedTurn = undefined;
   }
 
   run() {
@@ -124,6 +129,12 @@ export class Session {
       const text = this.texts.get(t.id)?.text ?? reportOf(t);
       this.texts.delete(t.id);
       this.emitTurn(t.id, t.status, text);
+    } else if (m.method === "thread/closed") {
+      // Codex 自己卸载了线程（正常回收），不是异常：不推送，只把"在跑"的记录清掉。
+      this.setActiveTurn(undefined);
+      this.saveStatus("up", "closed");
+    } else if (m.method === "thread/status/changed" && m.params.status?.type === "systemError") {
+      this.lost("systemError");
     } else if (m.method === "error") {
       this.emit({ event: "error", threadId: this.threadId, detail: m.params });
     }
@@ -165,15 +176,40 @@ export class Session {
     }
   }
 
+  private saveStatus(daemon: "up" | "reconnecting" | "down", thread?: string) {
+    writeStatus(this.threadId, { daemon, thread, activeTurnId: this.activeTurnId });
+  }
+
+  // 这一轮正在跑，Codex 却已经没了（进程崩溃、daemon 重启把线程卸载）：不会再有 turn_completed，主动告诉 Claude。
+  private lost(status: string) {
+    const turnId = this.activeTurnId;
+    if (!turnId) return;
+    this.setActiveTurn(undefined);
+    this.emitLost(turnId, status);
+  }
+
+  private emitLost(turnId: string, status: string, text?: string) {
+    this.lastEmitted = turnId;
+    writeLastEmitted(this.threadId, turnId);
+    this.emit({ event: "codex_lost", threadId: this.threadId, turnId, status, ...(text ? { partial: text } : {}), hint: "Codex 异常退出，这一轮不会再有结果；用 history 看已有进展，需要就 send 重发" });
+  }
+
+  // 探活：读一次线程状态，顺便落盘供 `status` 查询。读失败就断开连接，交给 reconnect。
   private async heartbeat() {
     if (this.reconnecting || !this.client) return;
-    try { await this.client.request("thread/loaded/list", {}, 8000); }
-    catch { this.client.close(); }
+    try {
+      const { thread } = await this.client.request("thread/read", { threadId: this.threadId, includeTurns: false }, 8000);
+      const status = thread?.status?.type as string | undefined;
+      if (status === "notLoaded" || status === "systemError") this.lost(status);
+      this.saveStatus("up", status);
+    } catch { this.client.close(); }
   }
 
   private async reconnect() {
     if (this.reconnecting) return;
     this.reconnecting = true;
+    this.crashedTurn ??= this.activeTurnId;
+    this.saveStatus("reconnecting");
     const dropped = [...this.approvals.keys()]; // 旧连接上的审批请求随连接失效
     this.approvals.clear();
     const giveUp = Date.now() + RECONNECT_GIVE_UP_MS;
@@ -185,14 +221,17 @@ export class Session {
         this.attach(c);
         await this.resume(c);
         this.reconnecting = false;
+        this.saveStatus("up");
         // 重连成功不出声，省一次唤醒；只有作废了未决审批才需要让 Claude 知道。
         if (dropped.length) this.emit({ event: "approvals_dropped", threadId: this.threadId, requestIds: dropped });
         return;
       } catch {
+        this.saveStatus("reconnecting");
         await sleep(delay);
         delay = Math.min(delay * 2, 15_000);
       }
     }
+    this.saveStatus("down");
     out({ event: "closed", threadId: this.threadId, reason: "重连超时" });
     process.exit(1);
   }

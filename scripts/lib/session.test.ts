@@ -41,3 +41,26 @@ test("残留的审批决定不会落到同 ID 的新请求上", () => {
   expect(events().map(e => e.event)).toEqual(["approval_requested"]);
   expect(takeDecision("thread-b", "7")).toBeUndefined();
 });
+
+test("线程在跑却被卸载时推 codex_lost，并写下状态", async () => {
+  const client = { request: async () => ({ thread: { status: { type: "notLoaded" } } }), respond() {}, respondError() {} } as any;
+  const session = new Session("thread-c", null);
+  session.attach(client);
+  client.onNotification({ method: "turn/started", params: { threadId: "thread-c", turn: { id: "t9" } } });
+  await (session as any).heartbeat();
+  await (session as any).heartbeat(); // 已经报过，不重复唤醒
+
+  expect(events().map(e => [e.event, e.turnId, e.status])).toEqual([["codex_lost", "t9", "notLoaded"]]);
+  expect((await import("./state")).readStatus("thread-c")).toMatchObject({ daemon: "up", thread: "notLoaded" });
+});
+
+test("Codex 自己卸载线程（thread/closed）不算异常，不推送", async () => {
+  const client = { request: async () => ({ thread: { status: { type: "notLoaded" } } }), respond() {}, respondError() {} } as any;
+  const session = new Session("thread-d", null);
+  session.attach(client);
+  client.onNotification({ method: "turn/started", params: { threadId: "thread-d", turn: { id: "t1" } } });
+  client.onNotification({ method: "thread/closed", params: { threadId: "thread-d" } });
+  await (session as any).heartbeat();
+
+  expect(events()).toEqual([]);
+});

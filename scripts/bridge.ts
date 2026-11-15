@@ -10,6 +10,7 @@
 //   （start / send 的 <text> 可以换成 --file <路径>，从文件读，避免长文本的 shell 转义问题）
 //   approve <thread> <requestId> [--session]   同意一个审批请求（--session：本会话内同类免问）
 //   deny <thread> <requestId>          拒绝一个审批请求
+//   status <thread>                    查 Codex 是否还活着：daemon、线程状态、监听进程
 //   list                               列出 claude-codex-bridge 开过的线程
 //   history <thread> [--limit N]       看最近几轮的提问与汇报
 //   rename <thread> <name>             改名
@@ -21,7 +22,7 @@ import { ensureDaemon, run, socketAlive } from "./lib/daemon";
 import { BridgeError, out } from "./lib/out";
 import { Session } from "./lib/session";
 import { readFileSync } from "node:fs";
-import { claimWatcher, readLastEmitted, watcherPid, writeDecision, writeLastEmitted } from "./lib/state";
+import { claimWatcher, readLastEmitted, readStatus, watcherPid, writeDecision, writeLastEmitted } from "./lib/state";
 import { defaultName, listThreads, renameThread, resolveThread, sendTurn, startThread, threadHistory } from "./lib/threads";
 
 type Flags = Map<string, string | true>;
@@ -87,6 +88,46 @@ async function doctor() {
   process.exit(checks.every(c => c.ok) ? 0 : 1);
 }
 
+const STATUS_STALE_MS = 90_000; // 探活 30 秒一次，连续 3 次没更新就算失联
+
+// 只读查询，不拉起 daemon：daemon 不在就如实报 down。
+async function status(ref: string) {
+  let daemon: "up" | "down" = "down";
+  let thread: string | undefined;
+  let threadId = ref;
+  if (await socketAlive()) {
+    try {
+      const c = await Client.connect();
+      threadId = await resolveThread(c, ref);
+      thread = (await c.request("thread/read", { threadId, includeTurns: false })).thread?.status?.type;
+      daemon = "up";
+    } catch (e) {
+      if (e instanceof BridgeError && /找不到|匹配到/.test(e.message)) throw e;
+    }
+  } else if (!/^[0-9a-f]{8}-/i.test(ref)) throw new BridgeError("daemon 不在线，无法按名字找线程", "改传线程 ID");
+  const saved = readStatus(threadId);
+  const watcher = watcherPid(threadId);
+  const age = saved ? Date.now() - Date.parse(saved.updatedAt) : undefined;
+  const watcherStale = !!saved && watcher !== undefined && age! > STATUS_STALE_MS;
+  // daemon 在线就以实时线程状态为准；落盘的 activeTurnId 最多滞后一个探活周期。
+  const running = daemon === "up" ? thread === "active" : !!saved?.activeTurnId;
+  const problems = [
+    daemon === "down" && "daemon 不在线",
+    thread === "systemError" && "线程处于 systemError",
+    saved?.activeTurnId && thread === "notLoaded" && "线程在跑却已被卸载",
+    running && watcher === undefined && "有轮次在跑但没有监听进程，结果和审批会漏掉",
+    watcherStale && "监听进程的探活记录已过期",
+    saved?.daemon === "down" && "监听进程重连 daemon 失败",
+  ].filter(Boolean);
+  out({
+    threadId, ok: problems.length === 0, problems, daemon, thread,
+    running,
+    watcher: watcher ?? null,
+    watcherReport: saved ? { daemon: saved.daemon, updatedAt: saved.updatedAt } : null,
+  });
+  process.exit(0);
+}
+
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const { pos, flags } = parseArgs(rest);
@@ -150,6 +191,11 @@ async function main() {
     process.exit(0);
   }
 
+  if (cmd === "status") {
+    need(1);
+    return status(pos[0]);
+  }
+
   if (cmd === "list") {
     const c = await connected();
     for (const t of await listThreads(c)) out(t);
@@ -174,7 +220,7 @@ async function main() {
     process.exit(0);
   }
 
-  throw new BridgeError("未知命令", "doctor | start | watch | send | approve | deny | list | history | rename");
+  throw new BridgeError("未知命令", "doctor | start | watch | send | approve | deny | status | list | history | rename");
 }
 
 main().catch(e => {

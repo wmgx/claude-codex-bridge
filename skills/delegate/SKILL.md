@@ -19,6 +19,10 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 5. **回答或追加指令**：`bridge send <线程名或ID> "<文本>"`，长文本用 `--file <文件>`。同一线程，上下文保留。输出里 `watching: false` 表示没有监听进程，先 `bridge watch` 挂上，否则收不到结果和审批请求。
 6. **Monitor 到期**（最长 30 分钟）：线程还需要继续时，用 `bridge watch <线程名或ID>` 重新挂上。到期期间完成的轮次会补发，已经上报过的不会重放。报"线程已有监听进程"说明原来的还在跑，不用再挂。
 
+## 查 Codex 是否还活着
+
+怀疑 Codex 卡住或挂了，或很久没动静时：`bridge status <线程名或ID>`。`ok:false` 时看 `problems`。监听进程每 30 秒探活并落盘，`watcher` 为 null 说明没有监听进程，用 `watch` 挂上。
+
 ## 事件
 
 | event | 怎么处理 |
@@ -28,6 +32,7 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 | `approval_requested` | **转给用户决定**，见下 |
 | `approval_resolved` | 审批超时，已自动拒绝，告诉用户。你执行 `approve` / `deny` 后不会有这个事件，直接等下一个事件 |
 | `heartbeat` | 只是让你的缓存续期，Codex 仍在跑。**什么都不用做**：不要打扰用户，不要发消息给 Codex，继续等下一个事件 |
+| `codex_lost` | Codex 异常退出，这一轮不会再有结果。告诉用户，用 `history` 看已有进展，需要就 `send` 重发 |
 | `approvals_dropped` | 连接断开重连过，`requestIds` 里的审批请求已失效。告诉用户不用再回复它们；Codex 需要时会重新发起 |
 | `error` / `closed` | 告诉用户；必要时 `watch` 重新订阅 |
 | `unsupported_request` | Codex 发来了本工具不支持的请求（已自动拒绝），告诉用户 |

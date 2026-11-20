@@ -25,8 +25,31 @@ export async function startThread(c: Client, cwd: string, name: string): Promise
   return threadId;
 }
 
-export const sendTurn = (c: Client, threadId: string, text: string) =>
-  c.request("turn/start", { threadId, input: [{ type: "text", text }] });
+// 每轮可选的覆盖项，Codex 会沿用到后续轮次。未给的字段不传，沿用线程现有设置（首轮即 Codex 的 config.toml）。
+export type TurnOptions = { model?: string; effort?: string; network?: boolean };
+
+export const sendTurn = (c: Client, threadId: string, text: string, opts: TurnOptions = {}) =>
+  c.request("turn/start", {
+    threadId,
+    input: [{ type: "text", text }],
+    ...(opts.model ? { model: opts.model } : {}),
+    ...(opts.effort ? { effort: opts.effort } : {}),
+    // 只改联网开关，其余与 thread/start 的 workspace-write 一致：工作目录和系统临时目录可写。
+    ...(opts.network === undefined ? {} : {
+      sandboxPolicy: { type: "workspaceWrite", writableRoots: [], networkAccess: opts.network, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
+    }),
+  });
+
+// 可选模型及各自支持的思考深度。
+export async function listModels(c: Client) {
+  const { data } = await c.request("model/list", {});
+  return (data as any[]).map(m => ({
+    model: m.model,
+    displayName: m.displayName,
+    efforts: (m.supportedReasoningEfforts ?? []).map((e: any) => e.reasoningEffort ?? e),
+    defaultEffort: m.defaultReasoningEffort,
+  }));
+}
 
 // 线程引用可以是 ID，也可以是 start 时起的名字。
 export async function resolveThread(c: Client, ref: string): Promise<string> {

@@ -8,11 +8,12 @@
 
 | 命令 | 作用 |
 |---|---|
-| `start <cwd> <text> [--name N] [--max-quiet M]` | 开线程，发第一轮，之后持续输出事件 |
+| `start <cwd> <text> [--name N] [--max-quiet M] [--model X] [--effort E] [--no-network]` | 开线程，发第一轮，之后持续输出事件。默认允许联网 |
 | `watch <thread> [--max-quiet M]` | 重新订阅已有线程的事件；补发上次上报之后完成的轮次，已上报的不重放 |
-| `send <thread> <text>` | 在同一线程继续发一轮；没有监听进程时输出里会带 `watching: false` |
+| `send <thread> <text> [--model X] [--effort E]` | 在同一线程继续发一轮，给了模型或思考深度就从这一轮起换；没有监听进程时输出里会带 `watching: false` |
 | `approve <thread> <id> [--session]` / `deny <thread> <id>` | 回应审批请求 |
 | `status <thread>` | 查 Codex 是否还活着：返回 `ok`、`problems`、`daemon`、`thread` 状态、`running`、监听进程 pid。只读，不会拉起 daemon |
+| `models` | 列出可选模型，以及每个模型支持的思考深度（`efforts`）和默认值 |
 | `list` | 列出 claude-codex-bridge 开过的线程 |
 | `history <thread> [--limit N]` | 最近几轮的提问与汇报 |
 | `rename <thread> <name>` | 改名 |
@@ -21,6 +22,8 @@
 `<thread>` 可以是线程 ID，也可以是 `start` 时起的名字。线程在 Codex 自己的列表里显示为 `[bridge] <名字>`。
 
 `start` 和 `send` 的 `<text>` 可以换成 `--file <路径>`，从文件读文本。方案较长或带引号、反引号、`$` 时用它，避免 shell 转义出错。
+
+`--model` / `--effort` 不给时用 Codex 自己 `config.toml` 里的设置；给了之后，后续轮次都沿用，直到再次指定。可选值用 `models` 查。
 
 同一个线程同时只允许一个监听进程（`start` 或 `watch`）：已有一个在跑时，再 `watch` 会报错并给出它的 pid。
 
@@ -48,7 +51,8 @@ Codex 的提问发生在一轮末尾：它把问题写出来、结束这一轮�
 线程固定为 Codex 的 auto 模式（`workspace-write` 沙箱 + `on-request` 审批 + `auto_review` 审查者）：
 
 - 沙箱内（线程工作目录、系统临时目录）的操作 Codex 直接做，不打扰。
-- 越出沙箱（如写家目录、联网）时，审批请求默认交给 Codex 的 `auto_review` 子代理按风险判断，通过或拒绝都不打扰用户。
+- **默认允许联网**：`workspace-write` 沙箱本身是断网的（连本机代理都连不上），bridge 开线程时打开了沙箱的网络开关。不需要联网的任务用 `start --no-network`。
+- 越出沙箱（如写家目录；`--no-network` 时的联网）时，审批请求默认交给 Codex 的 `auto_review` 子代理按风险判断，通过或拒绝都不打扰用户。
 - 仍落到用户这边的请求（如审查者无法决定）会变成 `approval_requested` 事件，**由用户决定**，Claude 不替用户批准。10 分钟无人回复自动拒绝。
 - 只读任务请在任务描述里写明"只读，不要改文件"。
 

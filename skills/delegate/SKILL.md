@@ -14,9 +14,11 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 1. **先确认方案**。派活前把方案、改动范围、验收标准写清楚，让用户确认。
 2. **不用预先自检**。`start` 会自己检查依赖并拉起 daemon；报错时按 `hint` 修，仍不行再跑 `bridge doctor`。
 3. **开线程并监听**：把完整方案写进一个临时文件，用 `Monitor` 工具运行 `bridge start <目录> --file <方案文件> --name <短名> [--max-quiet <分钟>]`（方案很短、不含引号和 `$` 时也可以直接写成 `bridge start <目录> "<方案>"`）。该进程一直连着线程，每个事件输出一行 JSON，作为通知唤醒你。不要轮询、不要 sleep。
+   **模型和思考深度**：用户指定了就加 `--model <模型>` / `--effort <深度>`；没指定就不加，沿用 Codex 默认配置。拿不准有哪些可选值时先跑 `bridge models`，每行一个模型，`efforts` 是它支持的思考深度。
+   **联网**：默认允许联网。用户要求不联网，或任务明显不需要网络时，加 `--no-network`。
    `--max-quiet` 是最长静默时间：Codex 一轮跑得太久时，bridge 会发一个 `heartbeat` 事件唤醒你一次，让你的 prompt 缓存续期，Codex 不受影响。默认 50 分钟（按 1 小时缓存留余量）；**如果你知道本会话缓存有效期是 5 分钟，就设成 4**；不想要心跳用 `--max-quiet 0`。
 4. **处理事件**（见下表）。
-5. **回答或追加指令**：`bridge send <线程名或ID> "<文本>"`，长文本用 `--file <文件>`。同一线程，上下文保留。输出里 `watching: false` 表示没有监听进程，先 `bridge watch` 挂上，否则收不到结果和审批请求。
+5. **回答或追加指令**：`bridge send <线程名或ID> "<文本>"`，长文本用 `--file <文件>`。需要中途换模型或思考深度时加 `--model` / `--effort`，从这一轮起生效并沿用。同一线程，上下文保留。输出里 `watching: false` 表示没有监听进程，先 `bridge watch` 挂上，否则收不到结果和审批请求。
 6. **Monitor 到期**（最长 30 分钟）：线程还需要继续时，用 `bridge watch <线程名或ID>` 重新挂上。到期期间完成的轮次会补发，已经上报过的不会重放。报"线程已有监听进程"说明原来的还在跑，不用再挂。
 
 ## 查 Codex 是否还活着
@@ -43,7 +45,7 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 
 ## 审批：批准权在用户手里
 
-线程是 auto 模式：沙箱内的操作 Codex 直接做；越出沙箱（写工作目录和 `/tmp` 之外、联网等）时，默认由 Codex 的 `auto_review` 子代理自动审批；只有仍转给用户的请求才会出现 `approval_requested`。
+线程是 auto 模式：沙箱内的操作 Codex 直接做；越出沙箱（写工作目录和 `/tmp` 之外；`--no-network` 时的联网等）时，默认由 Codex 的 `auto_review` 子代理自动审批；只有仍转给用户的请求才会出现 `approval_requested`。
 
 收到 `approval_requested` 时：
 
@@ -64,6 +66,7 @@ description: 把方案交给 Codex 执行并在同一线程里往返沟通。当
 
 ## 其他命令
 
+- `bridge models`：列出可选模型和各自支持的思考深度。
 - `bridge list`：列出 claude-codex-bridge 开过的线程。
 - `bridge history <线程> [--limit N]`：看最近几轮的提问与汇报。
 - `bridge rename <线程> <新名字>`：改名。

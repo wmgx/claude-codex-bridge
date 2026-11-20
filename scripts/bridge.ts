@@ -2,15 +2,18 @@
 // claude-codex-bridge：让 Claude Code 通过 Codex 本地 app-server daemon 开线程、派活、收事件。
 //
 //   doctor
-//   start <cwd> <text> [--name N] [--max-quiet M]   开线程并发第一轮，之后持续输出事件
+//   start <cwd> <text> [--name N] [--max-quiet M] [--model X] [--effort E] [--no-network]
+//                                      开线程并发第一轮，之后持续输出事件；默认允许联网
+//   （--model / --effort：模型和思考深度，不给就用 Codex 的 config.toml；之后的轮次沿用）
 //   watch <thread> [--max-quiet M]     重新订阅已有线程的事件
 //   （--max-quiet：最长静默分钟数，超过就输出一个 heartbeat 事件唤醒 Claude，避免它的缓存过期；
 //     不中断 Codex；默认 50，0 为不发）
-//   send <thread> <text>               在同一线程继续发一轮
+//   send <thread> <text> [--model X] [--effort E]   在同一线程继续发一轮；给了就从这一轮起换
 //   （start / send 的 <text> 可以换成 --file <路径>，从文件读，避免长文本的 shell 转义问题）
 //   approve <thread> <requestId> [--session]   同意一个审批请求（--session：本会话内同类免问）
 //   deny <thread> <requestId>          拒绝一个审批请求
 //   status <thread>                    查 Codex 是否还活着：daemon、线程状态、监听进程
+//   models                             列出可选模型及各自支持的思考深度
 //   list                               列出 claude-codex-bridge 开过的线程
 //   history <thread> [--limit N]       看最近几轮的提问与汇报
 //   rename <thread> <name>             改名
@@ -23,11 +26,11 @@ import { BridgeError, out } from "./lib/out";
 import { Session } from "./lib/session";
 import { readFileSync } from "node:fs";
 import { claimWatcher, readLastEmitted, readStatus, watcherPid, writeDecision, writeLastEmitted } from "./lib/state";
-import { defaultName, listThreads, renameThread, resolveThread, sendTurn, startThread, threadHistory } from "./lib/threads";
+import { type TurnOptions, defaultName, listModels, listThreads, renameThread, resolveThread, sendTurn, startThread, threadHistory } from "./lib/threads";
 
 type Flags = Map<string, string | true>;
 
-const VALUE_FLAGS = ["--name", "--limit", "--max-quiet", "--file"];
+const VALUE_FLAGS = ["--name", "--limit", "--max-quiet", "--file", "--model", "--effort"];
 
 function parseArgs(argv: string[]) {
   const pos: string[] = [];
@@ -35,6 +38,7 @@ function parseArgs(argv: string[]) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--session") flags.set("session", true);
+    else if (a === "--no-network") flags.set("no-network", true);
     else if (VALUE_FLAGS.includes(a)) {
       const v = argv[++i];
       if (v === undefined) throw new BridgeError(`${a} 后面需要一个值`);
@@ -55,6 +59,12 @@ function quietMs(flags: Flags): number {
   if (raw === "" || !Number.isFinite(min) || min < 0) throw new BridgeError("--max-quiet 需要非负数字（分钟）");
   return min * 60_000;
 }
+
+// --model / --effort；都不给就不覆盖，沿用线程现有设置。
+const turnOptions = (flags: Flags): TurnOptions => ({
+  model: flags.get("model") as string | undefined,
+  effort: flags.get("effort") as string | undefined,
+});
 
 // 要发给 Codex 的文本：--file 优先，否则取第 idx 个位置参数。
 function textOf(pos: string[], flags: Flags, idx: number): string {
@@ -149,8 +159,10 @@ async function main() {
     const session = new Session(threadId, null, quiet);
     session.attach(c);
     session.run();
-    await sendTurn(c, threadId, text);
-    out({ event: "started", threadId, name, mode: "auto", maxQuietMinutes: quiet / 60_000, observe: observeCommand(threadId) });
+    // workspace-write 沙箱默认断网；这里打开，--no-network 关掉。
+    const opts = { ...turnOptions(flags), network: !flags.has("no-network") };
+    await sendTurn(c, threadId, text, opts);
+    out({ event: "started", threadId, name, mode: "auto", model: opts.model ?? "default", effort: opts.effort ?? "default", network: opts.network, maxQuietMinutes: quiet / 60_000, observe: observeCommand(threadId) });
     return;
   }
 
@@ -175,7 +187,7 @@ async function main() {
     const text = textOf(pos, flags, 1);
     const c = await connected();
     const threadId = await resolveThread(c, pos[0]);
-    await sendTurn(c, threadId, text);
+    await sendTurn(c, threadId, text, turnOptions(flags));
     const watching = watcherPid(threadId) !== undefined;
     out({ sent: true, threadId, watching, ...(watching ? {} : { hint: "没有监听进程，收不到结果和审批请求；用 watch 挂上" }) });
     process.exit(0);
@@ -194,6 +206,12 @@ async function main() {
   if (cmd === "status") {
     need(1);
     return status(pos[0]);
+  }
+
+  if (cmd === "models") {
+    const c = await connected();
+    for (const m of await listModels(c)) out(m);
+    process.exit(0);
   }
 
   if (cmd === "list") {
@@ -220,7 +238,7 @@ async function main() {
     process.exit(0);
   }
 
-  throw new BridgeError("未知命令", "doctor | start | watch | send | approve | deny | status | list | history | rename");
+  throw new BridgeError("未知命令", "doctor | start | watch | send | approve | deny | status | models | list | history | rename");
 }
 
 main().catch(e => {

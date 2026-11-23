@@ -4,6 +4,8 @@
 
 > 与 OpenAI、Anthropic 无关联。Codex 是 OpenAI 的产品，Claude Code 是 Anthropic 的产品。
 
+每轮派单的规格格式、Codex 的决策权限和 Claude 的验收要求见[协作规范](skills/delegate/COLLABORATION.md)。
+
 ## 命令
 
 | 命令 | 作用 |

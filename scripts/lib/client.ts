@@ -1,4 +1,4 @@
-// app-server JSON-RPC 客户端（WebSocket over Unix socket）。
+// app-server JSON-RPC 客户端（WebSocket over Unix socket），Codex daemon 与自建 agy-daemon 共用。
 
 import { SOCK } from "./daemon";
 import { BridgeError } from "./out";
@@ -15,8 +15,8 @@ export class Client {
 
   private constructor(private ws: WebSocket) {}
 
-  static async connect(): Promise<Client> {
-    const ws = new WebSocket(`ws+unix://${SOCK}:/`);
+  static async connect(sockPath = SOCK): Promise<Client> {
+    const ws = new WebSocket(`ws+unix://${sockPath}:/`);
     const c = new Client(ws);
     ws.onmessage = e => c.route(JSON.parse(String(e.data)));
     ws.onclose = () => c.handleClose();
@@ -25,7 +25,7 @@ export class Client {
       ws.onopen = () => { clearTimeout(timer); resolve(); };
       ws.onerror = () => { clearTimeout(timer); reject(new BridgeError("连接 daemon 失败")); };
     });
-    await c.request("initialize", { clientInfo: { name: "claude-codex-bridge", version: "0.3.2" }, capabilities: { experimentalApi: true } });
+    await c.request("initialize", { clientInfo: { name: "claude-codex-bridge", version: "0.5.0" }, capabilities: { experimentalApi: true } });
     ws.send(JSON.stringify({ method: "initialized" }));
     return c;
   }
@@ -37,7 +37,7 @@ export class Client {
     if (!p) return;
     this.pending.delete(m.id);
     clearTimeout(p.timer);
-    if (m.error) p.reject(new BridgeError(`${m.error.message ?? "app-server 返回错误"} (code ${m.error.code})`));
+    if (m.error) p.reject(new BridgeError(`${m.error.message ?? "daemon 返回错误"} (code ${m.error.code})`));
     else p.resolve(m.result);
   }
 

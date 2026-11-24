@@ -1,9 +1,10 @@
 // 一个线程的监听会话：翻译事件、处理审批、断线重连并补发漏掉的结果。
+// Codex daemon 与自建 agy-daemon 使用同构 JSON-RPC 协议，共用此状态机。
 
 import { Client } from "./client";
-import { ensureDaemon } from "./daemon";
+import { ensureDaemon as ensureCodexDaemon } from "./daemon";
 import { out, sleep } from "./out";
-import { takeDecision, writeLastEmitted, writeStatus } from "./state";
+import { type Backend, takeDecision, writeLastEmitted, writeStatus } from "./state";
 
 const HEARTBEAT_MS = 30_000;
 const POLL_MS = 500;
@@ -15,6 +16,12 @@ type PendingApproval = { reqId: unknown; deadline: number };
 const APPROVAL_KIND: Record<string, string> = {
   "item/commandExecution/requestApproval": "command",
   "item/fileChange/requestApproval": "fileChange",
+};
+
+export type SessionBackendHooks = {
+  backend?: Backend;
+  ensureDaemon?: () => Promise<void>;
+  connect?: () => Promise<Client>;
 };
 
 // 一个 turn 里最后的汇报：优先 final_answer，没有就取最后一条 agentMessage。
@@ -33,8 +40,11 @@ export class Session {
   private baselined = false;
   private timers: ReturnType<typeof setInterval>[] = [];
   private activeTurnId?: string;
-  private crashedTurn?: string; // 断线时正在跑的轮次；重连后它若没正常完成，就是 Codex 崩了
+  private crashedTurn?: string; // 断线时正在跑的轮次；重连后它若没正常完成，就是执行端崩了
   private quietTimer?: ReturnType<typeof setTimeout>;
+  private readonly backend: Backend;
+  private readonly ensureDaemonFn: () => Promise<void>;
+  private readonly connectFn: () => Promise<Client>;
 
   // baseline: 最后一个已上报的完成轮，之后完成的轮次都要上报。
   // null 表示还没上报过任何轮次（线程刚创建）；
@@ -42,14 +52,22 @@ export class Session {
   //
   // quietMs: 最长静默时间，0 表示不限。Claude 每被唤醒一次（我们输出一个事件），它的 prompt 缓存有效期
   // 就从头算；静默太久缓存会失效，下一次唤醒要按全价重读上下文。所以在缓存失效之前输出一个
-  // heartbeat 事件把 Claude 唤醒一次，Codex 不受影响，继续跑。
-  constructor(readonly threadId: string, private baseline?: string | null, private quietMs = 0) {
+  // heartbeat 事件把 Claude 唤醒一次，执行端不受影响，继续跑。
+  constructor(
+    readonly threadId: string,
+    private baseline?: string | null,
+    private quietMs = 0,
+    hooks: SessionBackendHooks = {},
+  ) {
     if (baseline !== undefined) this.lastEmitted = baseline ?? undefined;
+    this.backend = hooks.backend ?? "codex";
+    this.ensureDaemonFn = hooks.ensureDaemon ?? ensureCodexDaemon;
+    this.connectFn = hooks.connect ?? (() => Client.connect());
   }
 
   // 所有对外事件都经过这里：输出即唤醒了 Claude，静默计时重新开始。
   private emit(o: Record<string, unknown>) {
-    out(o);
+    out({ agent: this.backend, ...o });
     this.rearmQuiet();
   }
 
@@ -97,8 +115,8 @@ export class Session {
     const idx = done.findIndex((t: any) => t.id === this.lastEmitted);
     const missed = idx >= 0 || !this.lastEmitted ? done.slice(idx + 1) : done.slice(-1);
     for (const t of missed) {
-      if (t.id === this.crashedTurn && t.status !== "completed") this.emitLost(t.id, t.status, reportOf(t));
-      else this.emitTurn(t.id, t.status, reportOf(t));
+      if (t.id === this.crashedTurn && t.status !== "completed") this.emitLost(t.id, t.status, reportOf(t), t.errorDetail);
+      else this.emitTurn(t.id, t.status, reportOf(t), t.actualModel);
     }
     this.crashedTurn = undefined;
   }
@@ -108,10 +126,24 @@ export class Session {
     this.timers.push(setInterval(() => this.pollApprovals(), POLL_MS));
   }
 
-  private emitTurn(turnId: string, status: string, text: string) {
+  stop() {
+    for (const t of this.timers) clearInterval(t);
+    this.timers = [];
+    if (this.quietTimer) clearTimeout(this.quietTimer);
+    this.quietTimer = undefined;
+  }
+
+  private emitTurn(turnId: string, status: string, text: string, actualModel?: string) {
     this.lastEmitted = turnId;
     writeLastEmitted(this.threadId, turnId);
-    this.emit({ event: "turn_completed", threadId: this.threadId, turnId, status, text });
+    this.emit({
+      event: "turn_completed",
+      threadId: this.threadId,
+      turnId,
+      status,
+      text,
+      ...(actualModel ? { actualModel } : {}),
+    });
   }
 
   private onNotification(m: any) {
@@ -128,13 +160,13 @@ export class Session {
       const t = m.params.turn;
       const text = this.texts.get(t.id)?.text ?? reportOf(t);
       this.texts.delete(t.id);
-      this.emitTurn(t.id, t.status, text);
+      this.emitTurn(t.id, t.status, text, t.actualModel);
     } else if (m.method === "thread/closed") {
-      // Codex 自己卸载了线程（正常回收），不是异常：不推送，只把"在跑"的记录清掉。
+      // 执行端自己卸载了线程（正常回收），不是异常：不推送，只把"在跑"的记录清掉。
       this.setActiveTurn(undefined);
       this.saveStatus("up", "closed");
     } else if (m.method === "thread/status/changed" && m.params.status?.type === "systemError") {
-      this.lost("systemError");
+      this.lost("systemError", m.params.status?.detail);
     } else if (m.method === "error") {
       this.emit({ event: "error", threadId: this.threadId, detail: m.params });
     }
@@ -177,21 +209,31 @@ export class Session {
   }
 
   private saveStatus(daemon: "up" | "reconnecting" | "down", thread?: string) {
-    writeStatus(this.threadId, { daemon, thread, activeTurnId: this.activeTurnId });
+    writeStatus(this.threadId, { backend: this.backend, daemon, thread, activeTurnId: this.activeTurnId });
   }
 
-  // 这一轮正在跑，Codex 却已经没了（进程崩溃、daemon 重启把线程卸载）：不会再有 turn_completed，主动告诉 Claude。
-  private lost(status: string) {
+  // 这一轮正在跑，执行端却已经没了（进程崩溃、daemon 重启把线程卸载）：不会再有 turn_completed，主动告诉 Claude。
+  private lost(status: string, detail?: string) {
     const turnId = this.activeTurnId;
     if (!turnId) return;
     this.setActiveTurn(undefined);
-    this.emitLost(turnId, status);
+    this.emitLost(turnId, status, undefined, detail);
   }
 
-  private emitLost(turnId: string, status: string, text?: string) {
+  private emitLost(turnId: string, status: string, text?: string, detail?: string) {
     this.lastEmitted = turnId;
     writeLastEmitted(this.threadId, turnId);
-    this.emit({ event: "codex_lost", threadId: this.threadId, turnId, status, ...(text ? { partial: text } : {}), hint: "Codex 异常退出，这一轮不会再有结果；用 history 看已有进展，需要就 send 重发" });
+    const label = this.backend === "codex" ? "Codex" : "Antigravity (agy)";
+    const event = this.backend === "codex" ? "codex_lost" : "agy_lost";
+    this.emit({
+      event,
+      threadId: this.threadId,
+      turnId,
+      status,
+      ...(text ? { partial: text } : {}),
+      ...(detail ? { detail } : {}),
+      hint: `${label} 异常退出，这一轮不会再有结果；用 history 看已有进展，需要就 send 重发`,
+    });
   }
 
   // 探活：读一次线程状态，顺便落盘供 `status` 查询。读失败就断开连接，交给 reconnect。
@@ -200,7 +242,7 @@ export class Session {
     try {
       const { thread } = await this.client.request("thread/read", { threadId: this.threadId, includeTurns: false }, 8000);
       const status = thread?.status?.type as string | undefined;
-      if (status === "notLoaded" || status === "systemError") this.lost(status);
+      if (status === "notLoaded" || status === "systemError") this.lost(status, thread?.status?.detail);
       this.saveStatus("up", status);
     } catch { this.client.close(); }
   }
@@ -216,8 +258,8 @@ export class Session {
     let delay = 1000;
     while (Date.now() < giveUp) {
       try {
-        await ensureDaemon();
-        const c = await Client.connect();
+        await this.ensureDaemonFn();
+        const c = await this.connectFn();
         this.attach(c);
         await this.resume(c);
         this.reconnecting = false;
@@ -232,7 +274,7 @@ export class Session {
       }
     }
     this.saveStatus("down");
-    out({ event: "closed", threadId: this.threadId, reason: "重连超时" });
+    out({ agent: this.backend, event: "closed", threadId: this.threadId, reason: "重连超时" });
     process.exit(1);
   }
 }

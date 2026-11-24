@@ -1,24 +1,43 @@
-// 按线程落盘的状态：审批决定、上报进度、监听进程。
+// 按线程落盘的状态：审批决定、上报进度、监听进程、双后端线程注册表、权限审计日志。
 // 审批请求只能在持有订阅的那条连接上回复，所以 `approve` / `deny` 命令把决定写成文件，
 // 由正在监听的进程读到后再回复 daemon。
 
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const BASE = join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"), "claude-codex-bridge");
-
+export type Backend = "codex" | "agy";
 export type Decision = "accept" | "acceptForSession" | "decline";
 
+export const stateBase = () => join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"), "claude-codex-bridge");
+export const agyStateDir = () => join(stateBase(), "agy");
+export const agySockPath = () => join(stateBase(), "agy-daemon.sock");
+export const agyDaemonPidFile = () => join(agyStateDir(), "daemon.pid");
+
 const safe = (s: string) => s.replace(/[^\w-]/g, "_");
-const dir = (threadId: string) => join(BASE, safe(threadId));
+const dir = (threadId: string) => join(stateBase(), safe(threadId));
 const file = (threadId: string, requestId: string) => join(dir(threadId), `${safe(requestId)}.json`);
 const lastEmittedFile = (threadId: string) => join(dir(threadId), "last-emitted");
 const watcherFile = (threadId: string) => join(dir(threadId), "watcher.pid");
+const statusFile = (threadId: string) => join(dir(threadId), "status.json");
+const registryFile = () => join(stateBase(), "threads.json");
+
+export const auditLogPath = (threadId: string) => join(dir(threadId), "audit.jsonl");
+
+function ensureDir(p: string) {
+  mkdirSync(p, { recursive: true, mode: 0o700 });
+}
 
 function write(threadId: string, path: string, content: string) {
-  mkdirSync(dir(threadId), { recursive: true, mode: 0o700 });
+  ensureDir(dir(threadId));
   writeFileSync(path, content, { mode: 0o600 });
+}
+
+function writeAtomic(path: string, content: string) {
+  ensureDir(stateBase());
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, content, { mode: 0o600 });
+  renameSync(tmp, path);
 }
 
 export function writeDecision(threadId: string, requestId: string, decision: Decision) {
@@ -68,10 +87,15 @@ export function watcherPid(threadId: string): number | undefined {
   }
 }
 
-// 监听进程每次探活后写一份：Claude 随时能用 `status` 查到 Codex 是否还活着，不必等事件。
-export type Status = { pid: number; updatedAt: string; daemon: "up" | "reconnecting" | "down"; thread?: string; activeTurnId?: string };
-
-const statusFile = (threadId: string) => join(dir(threadId), "status.json");
+// 监听进程每次探活后写一份：Claude 随时能用 `status` 查到执行端是否还活着，不必等事件。
+export type Status = {
+  pid: number;
+  updatedAt: string;
+  daemon: "up" | "reconnecting" | "down";
+  thread?: string;
+  activeTurnId?: string;
+  backend?: Backend;
+};
 
 export function writeStatus(threadId: string, s: Omit<Status, "pid" | "updatedAt">) {
   write(threadId, statusFile(threadId), JSON.stringify({ pid: process.pid, updatedAt: new Date().toISOString(), ...s }));
@@ -79,4 +103,60 @@ export function writeStatus(threadId: string, s: Omit<Status, "pid" | "updatedAt
 
 export function readStatus(threadId: string): Status | undefined {
   try { return JSON.parse(readFileSync(statusFile(threadId), "utf8")); } catch { return undefined; }
+}
+
+// 权限审计日志（每行一条 JSON，供排障和人工核查自审核/白名单放行记录）。
+export function appendAudit(threadId: string, entry: Record<string, unknown>) {
+  ensureDir(dir(threadId));
+  appendFileSync(auditLogPath(threadId), JSON.stringify({ at: new Date().toISOString(), ...entry }) + "\n", { mode: 0o600 });
+}
+
+// 本地线程注册表：记录 threadId 属于哪个执行端（codex / agy），让 send / watch / approve / status 免传 --agent。
+export type ThreadRecord = {
+  threadId: string;
+  backend: Backend;
+  name?: string;
+  cwd?: string;
+  updatedAt: string;
+};
+
+function readRegistryMap(): Record<string, ThreadRecord> {
+  try {
+    const parsed = JSON.parse(readFileSync(registryFile(), "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function registerThread(rec: Omit<ThreadRecord, "updatedAt">) {
+  const map = readRegistryMap();
+  const prev = map[rec.threadId];
+  map[rec.threadId] = {
+    threadId: rec.threadId,
+    backend: rec.backend,
+    name: rec.name ?? prev?.name,
+    cwd: rec.cwd ?? prev?.cwd,
+    updatedAt: new Date().toISOString(),
+  };
+  writeAtomic(registryFile(), JSON.stringify(map, null, 2));
+}
+
+export function getThreadRecord(threadId: string): ThreadRecord | undefined {
+  return readRegistryMap()[threadId];
+}
+
+export function listRegisteredThreads(backend?: Backend): ThreadRecord[] {
+  const list = Object.values(readRegistryMap());
+  return (backend ? list.filter(r => r.backend === backend) : list)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+export function findRegisteredThreads(ref: string, backend?: Backend): ThreadRecord[] {
+  const list = listRegisteredThreads(backend);
+  const byId = list.find(r => r.threadId === ref);
+  if (byId) return [byId];
+  const exact = list.filter(r => r.name === ref);
+  if (exact.length > 0) return exact;
+  return list.filter(r => typeof r.name === "string" && r.name.includes(ref));
 }

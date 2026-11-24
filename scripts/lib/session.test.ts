@@ -64,3 +64,28 @@ test("Codex 自己卸载线程（thread/closed）不算异常，不推送", asyn
 
   expect(events()).toEqual([]);
 });
+
+test("agy 后端异常失联推送 agy_lost，turn_completed 透传 actualModel", async () => {
+  const client = { request: async () => ({ thread: { status: { type: "systemError", detail: "boom" } } }), respond() {}, respondError() {} } as any;
+  const session = new Session("agy-1234", null, 0, { backend: "agy" });
+  session.attach(client);
+  client.onNotification({ method: "turn/started", params: { threadId: "agy-1234", turn: { id: "aturn-1" } } });
+  client.onNotification({ method: "item/completed", params: { threadId: "agy-1234", turnId: "aturn-1", item: { type: "agentMessage", phase: "final_answer", text: "ok" } } });
+  client.onNotification({ method: "turn/completed", params: { threadId: "agy-1234", turn: { id: "aturn-1", status: "completed", actualModel: "gemini-3.5-flash" } } });
+
+  client.onNotification({ method: "turn/started", params: { threadId: "agy-1234", turn: { id: "aturn-2" } } });
+  await (session as any).heartbeat();
+
+  expect(events()).toMatchObject([
+    { agent: "agy", event: "turn_completed", turnId: "aturn-1", text: "ok", actualModel: "gemini-3.5-flash" },
+    { agent: "agy", event: "agy_lost", turnId: "aturn-2", status: "systemError", detail: "boom" },
+  ]);
+});
+
+test("agy-* 命名的线程不会被误判为线程 ID", async () => {
+  const { isAgyThreadId, isDirectThreadId } = await import("./threads");
+  expect(isAgyThreadId("agy-b54a4507-0fe")).toBe(true);
+  expect(isDirectThreadId("agy-b54a4507-0fe")).toBe(true);
+  expect(isAgyThreadId("agy-smoke")).toBe(false);
+  expect(isDirectThreadId("agy-e2e-5765")).toBe(false);
+});

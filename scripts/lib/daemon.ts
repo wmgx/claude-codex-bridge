@@ -7,19 +7,23 @@ import { BridgeError } from "./out";
 
 export const SOCK = join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "app-server-control", "app-server-control.sock");
 
-export function run(cmd: string[]): { ok: boolean; stdout: string } {
+export function run(cmd: string[]): { ok: boolean; stdout: string; stderr: string } {
   try {
     const p = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe", timeout: 30_000 });
-    return { ok: p.exitCode === 0, stdout: new TextDecoder().decode(p.stdout).trim() };
+    return {
+      ok: p.exitCode === 0,
+      stdout: new TextDecoder().decode(p.stdout).trim(),
+      stderr: new TextDecoder().decode(p.stderr).trim(),
+    };
   } catch {
-    return { ok: false, stdout: "" };
+    return { ok: false, stdout: "", stderr: "" };
   }
 }
 
-export function socketAlive(): Promise<boolean> {
+export function socketAlive(sockPath = SOCK): Promise<boolean> {
   return new Promise(resolve => {
-    if (!existsSync(SOCK)) return resolve(false);
-    const ws = new WebSocket(`ws+unix://${SOCK}:/`);
+    if (!existsSync(sockPath)) return resolve(false);
+    const ws = new WebSocket(`ws+unix://${sockPath}:/`);
     const timer = setTimeout(() => { ws.close(); resolve(false); }, 3000);
     ws.onopen = () => { clearTimeout(timer); ws.close(); resolve(true); };
     ws.onerror = () => { clearTimeout(timer); resolve(false); };
@@ -27,8 +31,8 @@ export function socketAlive(): Promise<boolean> {
 }
 
 export async function ensureDaemon(): Promise<void> {
-  if (await socketAlive()) return;
+  if (await socketAlive(SOCK)) return;
   if (!run(["codex", "--version"]).ok) throw new BridgeError("找不到 codex 命令", "先安装 Codex CLI 并登录");
   run(["codex", "app-server", "daemon", "start"]);
-  if (!(await socketAlive())) throw new BridgeError("Codex daemon 启动失败", "手动运行 `codex app-server daemon start` 查看错误");
+  if (!(await socketAlive(SOCK))) throw new BridgeError("Codex daemon 启动失败", "手动运行 `codex app-server daemon start` 查看错误");
 }

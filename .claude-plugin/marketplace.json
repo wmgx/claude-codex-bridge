@@ -5,7 +5,7 @@
     {
       "name": "claude-codex-bridge",
       "source": "./",
-      "description": "让 Claude Code 出方案、Codex 执行，同一线程里往返沟通，事件触发。"
+      "description": "让 Claude Code 出方案、Codex 或 Antigravity (agy) 执行，同一线程里往返沟通，事件触发。"
     }
   ]
 }

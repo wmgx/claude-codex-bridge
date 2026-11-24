@@ -1,7 +1,7 @@
 {
   "name": "claude-codex-bridge",
-  "version": "0.4.1",
-  "description": "让 Claude Code 出方案、Codex 执行：直接开线程、派活、事件触发收结果，Codex 有问题在同一线程里回问。",
+  "version": "0.5.0",
+  "description": "让 Claude Code 出方案、Codex 或 Antigravity (agy) 执行：直接开线程、派活、事件触发收结果，在同一线程里往返沟通。",
   "author": {
     "name": "haotian"
   },
@@ -9,6 +9,9 @@
   "keywords": [
     "claude-code",
     "codex",
+    "antigravity",
+    "agy",
+    "gemini",
     "delegation",
     "multi-agent"
   ],

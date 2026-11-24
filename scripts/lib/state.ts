@@ -181,10 +181,73 @@ export function writeWaitCursor(threadId: string, seq: number) {
   write(threadId, waitCursorFile(threadId), String(seq));
 }
 
-// 权限审计日志（每行一条 JSON，供排障和人工核查自审核/白名单放行记录）。
+// 权限审计日志（每行一条 JSON，供排障和人工核查自审核/白名单/人工放行记录）。
+export type AuditEntry = Record<string, unknown> & {
+  at: string;
+  stage?: string;
+  decision?: string;
+  reason?: string;
+  kind?: string;
+  command?: string;
+  locations?: string[];
+  requestId?: string;
+};
+
 export function appendAudit(threadId: string, entry: Record<string, unknown>) {
   ensureDir(dir(threadId));
   appendFileSync(auditLogPath(threadId), JSON.stringify({ at: new Date().toISOString(), ...entry }) + "\n", { mode: 0o600 });
+}
+
+export function readAudit(threadId: string): AuditEntry[] {
+  try {
+    const raw = readFileSync(auditLogPath(threadId), "utf8");
+    const out: AuditEntry[] = [];
+    for (const line of raw.split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      try { out.push(JSON.parse(t)); } catch {}
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+export type AuditSummary = {
+  total: number;
+  byStage: Record<string, number>;
+  byDecision: Record<string, number>;
+  recent: AuditEntry[];
+};
+
+export function summarizeAudit(entries: AuditEntry[], limit = 20): AuditSummary {
+  const byStage: Record<string, number> = {};
+  const byDecision: Record<string, number> = {};
+  for (const e of entries) {
+    const stage = String(e.stage ?? "unknown");
+    const dec = String(e.decision ?? "unknown");
+    byStage[stage] = (byStage[stage] ?? 0) + 1;
+    byDecision[dec] = (byDecision[dec] ?? 0) + 1;
+  }
+  return {
+    total: entries.length,
+    byStage,
+    byDecision,
+    recent: limit > 0 ? entries.slice(-limit) : [],
+  };
+}
+
+export function agyLogPath(tag = "shared-acp"): string {
+  return join(agyStateDir(), "logs", `${safe(tag)}.log`);
+}
+
+export function readTailLines(path: string, limit = 50): string[] {
+  try {
+    const lines = readFileSync(path, "utf8").split("\n").filter(l => l.length > 0);
+    return limit > 0 ? lines.slice(-limit) : lines;
+  } catch {
+    return [];
+  }
 }
 
 // 本地线程注册表：记录 threadId 属于哪个执行端（codex / agy），让 send / watch / approve / status 免传 --agent。

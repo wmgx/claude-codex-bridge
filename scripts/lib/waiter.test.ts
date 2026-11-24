@@ -7,7 +7,7 @@ const tempState = mkdtempSync(join(tmpdir(), "bridge-waiter-test-"));
 process.env.XDG_STATE_HOME = tempState;
 
 const { Session } = await import("./session");
-const { appendEvent, gcState, readStatus, readWaitCursor, registerThread, writeDecision, writeLastEmitted } = await import("./state");
+const { appendAudit, appendEvent, gcState, readAudit, readStatus, readTailLines, readWaitCursor, registerThread, summarizeAudit, writeDecision, writeLastEmitted } = await import("./state");
 const { stripInternalFields, waitForNextEvent } = await import("./waiter");
 
 const log = spyOn(console, "log").mockImplementation(() => {});
@@ -74,6 +74,12 @@ test("审批不断链闭环：Session 保持连接存活，Waiter 1 立即唤醒
     await Bun.sleep(600);
     expect(responses).toEqual([{ id: 42, result: { decision: "accept" } }]);
     expect(readStatus(tid)?.pendingApprovals).toBeUndefined();
+
+    // Codex 侧审批请求与人工决定也统一落盘 audit.jsonl
+    const codexAudit = summarizeAudit(readAudit(tid));
+    expect(codexAudit.total).toBe(2);
+    expect(codexAudit.byStage).toEqual({ codex_escalation: 1, user_decision: 1 });
+    expect(codexAudit.byDecision).toEqual({ ask_user: 1, accept: 1 });
 
     // 紧接着该轮完成，Waiter #2 立刻拿到 turn_completed
     fakeClient.onNotification({ method: "item/completed", params: { threadId: tid, turnId: "t1", item: { type: "agentMessage", phase: "final_answer", text: "pushed ok" } } });
@@ -157,4 +163,23 @@ test("gcState 支持 dryRun，仅清理超期旧线程并保留近期线程", as
   expect(real.prunedRegistry).toContain(oldId);
   expect(existsSync(oldDir)).toBe(false);
   expect(existsSync(join(tempState, "claude-codex-bridge", freshId))).toBe(true);
+});
+
+test("summarizeAudit 与 readTailLines 准确汇总并截断", async () => {
+  const tid = "audit-summary-thread";
+  appendAudit(tid, { stage: "allowlist", decision: "allow", command: "bun test" });
+  appendAudit(tid, { stage: "auto_review_api", decision: "allow", command: "cd app && bun test" });
+  appendAudit(tid, { stage: "hard_deny", decision: "deny", command: "rm -rf /" });
+
+  const sum = summarizeAudit(readAudit(tid), 2);
+  expect(sum.total).toBe(3);
+  expect(sum.byStage).toEqual({ allowlist: 1, auto_review_api: 1, hard_deny: 1 });
+  expect(sum.byDecision).toEqual({ allow: 2, deny: 1 });
+  expect(sum.recent).toHaveLength(2);
+  expect(sum.recent[1].command).toBe("rm -rf /");
+
+  const { writeFileSync } = await import("node:fs");
+  const sampleLog = join(tempState, "sample.log");
+  writeFileSync(sampleLog, "line1\nline2\nline3\nline4\n");
+  expect(readTailLines(sampleLog, 2)).toEqual(["line3", "line4"]);
 });

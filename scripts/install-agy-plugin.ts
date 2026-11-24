@@ -79,8 +79,9 @@ description: 把已定方案派给本机 Codex 执行并在同一线程里多轮
    - \`codex_lost\` / \`closed\` / \`error\`：告诉用户并用 \`bridge history <线程>\` 查看已有进展，必要时 \`send --wait\` 重发。
 4. **同一线程追问或返工**：
    - \`bun "${BRIDGE_SCRIPT}" send <线程> "<文本>" --wait\`（长文本用 \`--file <文件>\`），自动复用后台监听并在收到下一条事件时退出唤醒你。
-5. **中途查看进度或取消**：
-   - \`bun "${BRIDGE_SCRIPT}" status <线程>\`：只读查询存活状态、\`pendingApprovals\` 与进度，不拉起 daemon。
+5. **中途查看进度、审计或取消**：
+   - \`bun "${BRIDGE_SCRIPT}" status <线程>\`：只读查询存活状态、\`pendingApprovals\` 与实时 \`progress\`，不拉起 daemon。
+   - \`bun "${BRIDGE_SCRIPT}" audit <线程>\` / \`logs <线程>\`：查看权限审计汇总与最近事件流。
    - \`bun "${BRIDGE_SCRIPT}" cancel <线程>\`：中断当前正在运行的轮次。
 6. **任务完成后收尾**：
    - 执行 \`bun "${BRIDGE_SCRIPT}" stop <线程>\` 关闭后台监听进程（线程历史仍保留，随时可 \`history\` 或再次 \`send --wait\`）。

@@ -20,6 +20,8 @@
 //   models [--agent codex|agy|all]     列出可选模型及各自支持的思考深度
 //   list [--agent codex|agy|all]       列出 claude-codex-bridge 开过的线程
 //   history <thread> [--limit N]       看最近几轮的提问与汇报
+//   audit <thread> [--limit N] [--raw] 查看权限审计汇总（--raw 逐行输出明细）
+//   logs <thread> [--limit N] [--acp]  查看线程最近事件流（--acp 查看 agy ACP 后台日志尾部）
 //   rename <thread> <name>             改名
 //   gc [--days N] [--dry-run]          清理超过 N 天（默认 14）且无活跃监听的旧状态与日志
 //   daemon stop <codex|agy>            停止指定执行端的本地常驻 daemon
@@ -47,15 +49,22 @@ import { Session } from "./lib/session";
 import {
   type Backend,
   type ProgressSummary,
+  agyLogPath,
+  auditLogPath,
   claimWatcher,
+  eventsLogPath,
   findRegisteredThreads,
   gcState,
   getThreadRecord,
   latestEventSeq,
+  readAudit,
+  readEvents,
   readLastEmitted,
   readStatus,
+  readTailLines,
   registerThread,
   releaseWatcher,
+  summarizeAudit,
   watcherPid,
   writeDecision,
   writeLastEmitted,
@@ -85,7 +94,7 @@ import {
 
 type Flags = Map<string, string | true>;
 
-const BOOL_FLAGS = new Set(["--session", "--no-network", "--once", "--wait", "--dry-run"]);
+const BOOL_FLAGS = new Set(["--session", "--no-network", "--once", "--wait", "--dry-run", "--raw", "--acp"]);
 const VALUE_FLAGS = new Set(["--agent", "--name", "--limit", "--max-quiet", "--file", "--model", "--effort", "--idle-exit", "--timeout", "--days"]);
 
 // 允许 flag 出现在子命令前或后，并支持 --flag=value 写法。
@@ -632,6 +641,61 @@ async function main() {
     process.exit(0);
   }
 
+  if (cmd === "audit") {
+    need(1);
+    const inferred = inferBackendOffline(pos[0], explicitAgent());
+    let backend = inferred.backend;
+    let threadId = inferred.threadId;
+    if (!threadId) {
+      const resolved = await resolveTarget(pos[0], explicitAgent());
+      backend = resolved.backend;
+      threadId = resolved.threadId;
+      resolved.client.close();
+    }
+    const entries = readAudit(threadId);
+    const raw = flags.has("raw");
+    const limit = Number(flags.get("limit")) || (raw ? 50 : 20);
+    if (raw) {
+      if (entries.length === 0) out({ agent: backend, threadId, total: 0, auditFile: auditLogPath(threadId) });
+      else for (const e of entries.slice(-limit)) out({ agent: backend, threadId, ...e });
+    } else {
+      out({ agent: backend, threadId, auditFile: auditLogPath(threadId), ...summarizeAudit(entries, limit) });
+    }
+    process.exit(0);
+  }
+
+  if (cmd === "logs") {
+    need(1);
+    const inferred = inferBackendOffline(pos[0], explicitAgent());
+    let backend = inferred.backend;
+    let threadId = inferred.threadId;
+    if (!threadId) {
+      const resolved = await resolveTarget(pos[0], explicitAgent());
+      backend = resolved.backend;
+      threadId = resolved.threadId;
+      resolved.client.close();
+    }
+    const limit = Number(flags.get("limit")) || (flags.has("acp") ? 50 : 30);
+    if (flags.has("acp")) {
+      if (backend !== "agy") throw new BridgeError("--acp 日志仅适用于 agy 线程");
+      const perThreadLog = agyLogPath(threadId);
+      const sharedLog = agyLogPath("shared-acp");
+      const perLines = readTailLines(perThreadLog, limit);
+      const useShared = perLines.length === 0;
+      const logFile = useShared ? sharedLog : perThreadLog;
+      const lines = useShared ? readTailLines(sharedLog, limit) : perLines;
+      out({ agent: backend, threadId, logFile, count: lines.length, lines });
+      process.exit(0);
+    }
+    const events = readEvents(threadId);
+    if (events.length === 0) {
+      out({ agent: backend, threadId, total: 0, eventsFile: eventsLogPath(threadId) });
+    } else {
+      for (const e of events.slice(-limit)) out(e);
+    }
+    process.exit(0);
+  }
+
   if (cmd === "rename") {
     need(2);
     const { backend, client: c, threadId } = await resolveTarget(pos[0], explicitAgent());
@@ -642,7 +706,7 @@ async function main() {
     process.exit(0);
   }
 
-  throw new BridgeError("未知命令", "doctor | start | watch | wait | cancel | stop | send | approve | deny | status | models | list | history | rename | gc | daemon stop");
+  throw new BridgeError("未知命令", "doctor | start | watch | wait | cancel | stop | send | approve | deny | status | models | list | history | audit | logs | rename | gc | daemon stop");
 }
 
 main().catch(e => {

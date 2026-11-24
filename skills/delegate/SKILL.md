@@ -68,5 +68,7 @@ Codex 旁观命令必须带线程 ID（名字不行），以事件里的 `observ
 - `bridge models [--agent codex|agy|all]`：列出可选模型和各自支持的思考深度。
 - `bridge list [--agent codex|agy|all]`：列出 claude-codex-bridge 开过的线程。
 - `bridge history <线程> [--limit N]`：看最近几轮的提问与汇报。
+- `bridge audit <线程> [--limit N] [--raw]`：看权限审计汇总或逐行明细。
+- `bridge logs <线程> [--limit N] [--acp]`：看最近事件流或 `agy` ACP 后台日志尾部。
 - `bridge rename <线程> <新名字>`：改名。
 - `bridge daemon stop <codex|agy>`：停止对应执行端的常驻 daemon。

@@ -8,6 +8,7 @@ import {
   type Backend,
   type PendingApprovalSummary,
   type ProgressSummary,
+  appendAudit,
   appendEvent,
   releaseWatcher,
   takeDecision,
@@ -233,6 +234,19 @@ export class Session {
     };
     this.approvals.set(requestId, { reqId: m.id, deadline: Date.now() + APPROVAL_TIMEOUT_MS, summary });
     this.saveStatus("up");
+    // agy-daemon 已记录完整四段审计；这里仅补记 Codex 侧落到人工层的审批请求，避免 agy 重复记录。
+    if (this.backend === "codex") {
+      appendAudit(this.threadId, {
+        stage: "codex_escalation",
+        decision: "ask_user",
+        requestId,
+        kind,
+        command: m.params.command,
+        grantRoot: m.params.grantRoot,
+        cwd: m.params.cwd,
+        reason: m.params.reason,
+      });
+    }
     this.emit({
       event: "approval_requested",
       threadId: this.threadId,
@@ -254,6 +268,16 @@ export class Session {
       this.approvals.delete(requestId);
       this.client?.respond(p.reqId, { decision: decision ?? "decline" });
       this.saveStatus("up");
+      if (this.backend === "codex") {
+        appendAudit(this.threadId, {
+          stage: decision ? "user_decision" : "timeout",
+          decision: decision ?? "decline",
+          requestId,
+          kind: p.summary.kind,
+          command: p.summary.command,
+          grantRoot: p.summary.grantRoot,
+        });
+      }
       // 正常批准或拒绝是宿主刚执行的，不用再唤醒一次；只有超时自动拒绝才上报。
       if (decision) {
         this.rearmQuiet();

@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Run unit & mock-ACP integration tests
+        run: bun test
+
+      - name: Verify all TypeScript entrypoints bundle cleanly
+        run: >
+          bun build --target=bun --outdir=/tmp/bridge-build-check
+          scripts/bridge.ts
+          scripts/agy-daemon.ts
+          scripts/approve-guard.ts
+          scripts/install-agy-plugin.ts
+
+      - name: Smoke-test approve-guard hooks (Claude Code & Antigravity)
+        run: |
+          printf '{"tool_input":{"command":"bun scripts/bridge.ts approve t1 1"}}' \
+            | bun scripts/approve-guard.ts | grep -q '"permissionDecision":"ask"'
+          printf '{"hookEventName":"PreToolUse","toolCall":{"name":"run_command","args":{"CommandLine":"bun scripts/bridge.ts --agent codex approve t1 1"}}}' \
+            | bun scripts/approve-guard.ts | grep -q '"decision":"force_ask"'
+          printf '{"hookEventName":"PreToolUse","toolCall":{"name":"run_command","args":{"CommandLine":"bun scripts/bridge.ts status t1"}}}' \
+            | bun scripts/approve-guard.ts | grep -q '"decision":"allow"'

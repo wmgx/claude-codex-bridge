@@ -28,6 +28,8 @@
 | `models [--agent codex\|agy\|all]` | 列出可选模型，以及每个模型支持的思考深度（`efforts`）和默认值 |
 | `list [--agent codex\|agy\|all]` | 列出 claude-codex-bridge 开过的线程（默认聚合两个后端） |
 | `history <thread> [--limit N]` | 最近几轮的提问与汇报 |
+| `audit <thread> [--limit N] [--raw]` | 汇总权限审计记录（按阶段/决定分类，覆盖白名单、自审核、人工确认与超时；`--raw` 逐行输出明细） |
+| `logs <thread> [--limit N] [--acp]` | 查看线程最近事件流（`events.jsonl`）；`--acp` 查看 `agy` 后台 ACP 日志尾部 |
 | `rename <thread> <name>` | 改名 |
 | `gc [--days N] [--dry-run]` | 清理超过 `N` 天（默认 14）且无活跃监听/轮次的旧状态目录与日志 |
 | `daemon stop <codex\|agy>` | 停止指定执行端的本地常驻 daemon |
@@ -149,7 +151,17 @@ bun scripts/install-agy-plugin.ts
 - `codex agents`：浏览 daemon 上的所有会话，bridge 开的显示为 `[bridge] <名字>`。
 - `codex resume <线程ID> --remote unix://`：连到同一个 daemon 实时观看。只看，不要在旁观窗口发消息或批审批。
 
-`agy` 线程按设计不提供实时 TUI 旁观，可通过 `~/.local/state/claude-codex-bridge/<threadId>/audit.jsonl` 查看权限审计记录，或用 `bridge history <线程>` 查看每轮汇报。
+`agy` 线程按设计不提供实时 TUI 旁观，可用 `bridge status <线程>` 看实时工具步数与 token 进度、`bridge audit <线程>` 汇总权限审计、`bridge logs <线程> --acp` 看底层 ACP 日志，或用 `bridge history <线程>` 查看每轮汇报。
+
+## 常见问题排查
+
+| 现象 | 排查命令与处理 |
+|---|---|
+| `agy` 首次开线程或 `models` 耗时较长 | 首次冷启动会拉取远端配置与模型列表（约 10–20s），随后 `agy-daemon` 保持单进程热复用，后续 `models` 与开线程秒级响应 |
+| `agy_lost` 提示登录或 OAuth 过期 | 在终端运行 `agy acp --login` 重新登录，然后 `bridge send <线程> ...` 继续 |
+| `agy` 429 限流或模型降级 | 查看 `turn_completed` 的 `actualModel` 字段或运行 `bridge logs <线程> --acp`；必要时 `send --model <模型>` 切换 |
+| Monitor 30 分钟到期或忘记是否在跑 | 运行 `bridge status <线程>` 查看 `running`、`watcher`、`pendingApprovals` 和 `progress`；缺失监听时用 `bridge watch <线程>` 续上 |
+| 状态目录或日志占用增长 | 运行 `bridge gc --days 14 --dry-run` 预览，确认后去掉 `--dry-run` 清理旧线程状态与日志 |
 
 ## 安全
 
@@ -162,7 +174,7 @@ bun scripts/install-agy-plugin.ts
 
 - Codex 依赖实验性的 app-server 协议（已测 Codex CLI 0.166.0 / daemon 0.167.0）；`agy` 依赖 `agy acp` 协议（已测 `agy 1.5.15`），CLI 升级后可能需要跟进适配。
 - Monitor 最长 30 分钟，长任务到期后用 `watch` 续上。
-- 单元测试（`bun test`）共 30 项，覆盖双宿主护栏、一次性等待与审批不断链、单进程多路复用、`cancel`/实时进度、`gc`、策略引擎、fail-closed 自审核与 `Session` 状态机；真实端到端已测 `agy 1.5.15`（含真实 `session/request_permission`、复用与取消）及 `Codex CLI 0.166.0`。
+- 单元测试（`bun test`）共 31 项，覆盖双宿主护栏、一次性等待与审批不断链、单进程多路复用、`cancel`/实时进度、`audit`/`logs`/`gc`、策略引擎、fail-closed 自审核与 `Session` 状态机；真实端到端已测 `agy 1.5.15`（含真实 `session/request_permission`、复用与取消）及 `Codex CLI 0.166.0`。
 
 ## License
 

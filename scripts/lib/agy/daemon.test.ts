@@ -24,8 +24,10 @@ const modeEnv = process.env.FAKE_ACP_MODES || "default,accept-edits,auto";
 const modes = modeEnv.split(",").filter(Boolean).map(id => ({ id, name: id }));
 let curMode = modes[0]?.id || "default";
 let curModel = "gemini-3.5-pro";
+let sessSeq = 0;
 let reqSeq = 100;
 const pending = new Map<number, (r: any) => void>();
+const cancelHandlers = new Map<string, () => void>();
 
 function send(o: Record<string, unknown>) {
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\\n");
@@ -55,6 +57,15 @@ async function handlePrompt(id: unknown, sessionId: string, text: string) {
   if (text.includes("CRASH_NOW")) {
     process.stderr.write("OAuth token expired, please login again\\n");
     process.exit(42);
+  }
+  if (text.includes("CANCEL_WAIT")) {
+    send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "tc-run", name: "run_command", title: "bun test", kind: "execute", status: "in_progress" } } });
+    send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "usage_update", used: 4321, size: 1048576 } } });
+    await new Promise<void>(resolve => { cancelHandlers.set(sessionId, resolve); });
+    cancelHandlers.delete(sessionId);
+    send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "已按请求取消" } } } });
+    send({ id, result: { stopReason: "cancelled" } });
+    return;
   }
   if (text.includes("THINK_AND_TOOL")) {
     send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "内部秘密思考" } } } });
@@ -105,10 +116,11 @@ while (true) {
     if (msg.method === "initialize") {
       send({ id: msg.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
     } else if (msg.method === "session/new") {
+      const sid = "acp-sess-" + (++sessSeq);
       send({
         id: msg.id,
         result: {
-          sessionId: "acp-sess-1",
+          sessionId: sid,
           modes: { currentModeId: curMode, availableModes: modes },
           models: {
             currentModelId: curModel,
@@ -121,6 +133,11 @@ while (true) {
       });
     } else if (msg.method === "session/resume" || msg.method === "session/load") {
       send({ id: msg.id, result: { sessionId: msg.params.sessionId, modes: { currentModeId: curMode, availableModes: modes } } });
+    } else if (msg.method === "session/close") {
+      send({ id: msg.id, result: {} });
+    } else if (msg.method === "session/cancel") {
+      const fn = cancelHandlers.get(msg.params?.sessionId);
+      if (fn) fn();
     } else if (msg.method === "session/set_mode") {
       curMode = msg.params.modeId;
       send({ id: msg.id, result: {} });
@@ -345,6 +362,83 @@ test("agy acp 子进程异常退出时推送 agy_lost 并附带认证诊断提�
     expect(lost.agent).toBe("agy");
     expect(lost.status).toBe("systemError");
     expect(lost.detail).toContain("未登录或凭据已过期");
+  } finally {
+    core.stop();
+  }
+});
+
+test("单进程多 session 复用：model/list 与多并发线程共用同一个 agy acp 子进程", async () => {
+  let spawnCount = 0;
+  const core = new AgyDaemonCore({
+    userPolicy: () => ({}),
+    spawnAcp: cwd => {
+      spawnCount++;
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+      return { acp: new AcpClient([process.execPath, fakeAcpScript], cwd, env), sandboxed: true };
+    },
+  });
+  try {
+    const c = connectInMemory(core, "p-mux");
+    await c.request("model/list", {});
+    const { thread: t1 } = await c.request("thread/start", { cwd: tempWork });
+    const { thread: t2 } = await c.request("thread/start", { cwd: tempWork });
+    writeLastEmitted(t1.id, null);
+    writeLastEmitted(t2.id, null);
+
+    // model/list + 两个并发线程只启动了 1 个 agy acp 子进程
+    expect(spawnCount).toBe(1);
+
+    const s1 = new Session(t1.id, null, 0, { backend: "agy" });
+    const s2 = new Session(t2.id, null, 0, { backend: "agy" });
+    const c1 = connectInMemory(core, "p-mux-1");
+    const c2 = connectInMemory(core, "p-mux-2");
+    s1.attach(c1);
+    s2.attach(c2);
+    await c1.request("thread/resume", { threadId: t1.id });
+    await c2.request("thread/resume", { threadId: t2.id });
+
+    await c1.request("turn/start", { threadId: t1.id, input: [{ type: "text", text: "alpha" }] });
+    await c2.request("turn/start", { threadId: t2.id, input: [{ type: "text", text: "beta" }] });
+    await waitFor(() => events().filter(e => e.event === "turn_completed").length === 2);
+
+    const byThread = Object.fromEntries(events().filter(e => e.event === "turn_completed").map(e => [e.threadId, e.text]));
+    expect(byThread[t1.id]).toContain("alpha");
+    expect(byThread[t2.id]).toContain("beta");
+  } finally {
+    core.stop();
+  }
+});
+
+test("长任务实时进度（progress）与 turn/interrupt 取消闭环", async () => {
+  const core = makeCore();
+  try {
+    const c = connectInMemory(core, "p-cancel");
+    const { thread } = await c.request("thread/start", { cwd: tempWork });
+    writeLastEmitted(thread.id, null);
+
+    const session = new Session(thread.id, null, 0, { backend: "agy" });
+    session.attach(c);
+
+    await c.request("turn/start", { threadId: thread.id, input: [{ type: "text", text: "CANCEL_WAIT" }] });
+    await sleep(80);
+
+    const read = await c.request("thread/read", { threadId: thread.id, includeTurns: false });
+    expect(read.thread.status.type).toBe("active");
+    expect(read.thread.progress).toMatchObject({
+      toolCalls: 1,
+      lastTool: "run_command: bun test",
+      tokensUsed: 4321,
+      tokenLimit: 1048576,
+    });
+
+    const intr = await c.request("turn/interrupt", { threadId: thread.id });
+    expect(intr).toMatchObject({ interrupted: true, turnId: "aturn-1" });
+
+    await waitFor(() => events().some(e => e.event === "turn_completed"));
+    const done = events().find(e => e.event === "turn_completed");
+    expect(done.status).toBe("cancelled");
+    expect(done.text).toBe("已按请求取消");
   } finally {
     core.stop();
   }

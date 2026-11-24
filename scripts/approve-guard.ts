@@ -3,7 +3,7 @@
 // 批准权不能只靠提示词约束：Codex / Antigravity (agy) 的汇报会进入 Claude 的上下文，可能诱导它自行批准。
 // 其他命令（包括 deny，以及 send/start 正文里出现 approve 字样）不拦，直接放行。
 
-const VALUE_FLAGS = new Set(["--agent", "--name", "--limit", "--max-quiet", "--file", "--model", "--effort", "--idle-exit", "--timeout"]);
+const VALUE_FLAGS = new Set(["--agent", "--name", "--limit", "--max-quiet", "--file", "--model", "--effort", "--idle-exit", "--timeout", "--days"]);
 const SHELL_BINS = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
 
 type Token = { text: string; quoted: boolean };
@@ -182,19 +182,37 @@ export function shouldAskApproval(command: string, depth = 0): boolean {
   return false;
 }
 
+const REASON = "这会批准执行端（Codex / agy）的一个越权请求，需要你确认";
+
+// 同时兼容 Claude Code（tool_input.command）与 Antigravity（toolCall.args.CommandLine）两种 PreToolUse 协议。
+// 注意：Antigravity 的 PreToolUse 为 fail-closed，不拦截时必须显式返回 {"decision":"allow"} 以继续走默认权限策略。
+export function evaluateHookInput(input: any): Record<string, unknown> | undefined {
+  if (input && typeof input === "object" && input.toolCall && typeof input.toolCall === "object") {
+    const args = input.toolCall.args ?? {};
+    const command = String(args.CommandLine ?? args.command ?? "");
+    if (shouldAskApproval(command)) {
+      return { decision: "force_ask", reason: REASON };
+    }
+    return { decision: "allow" };
+  }
+  const command: string = input?.tool_input?.command ?? "";
+  if (shouldAskApproval(command)) {
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "ask",
+        permissionDecisionReason: REASON,
+      },
+    };
+  }
+  return undefined;
+}
+
 if (import.meta.main) {
   try {
     const input = JSON.parse(await Bun.stdin.text());
-    const command: string = input?.tool_input?.command ?? "";
-    if (shouldAskApproval(command)) {
-      console.log(JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          permissionDecision: "ask",
-          permissionDecisionReason: "这会批准执行端（Codex / agy）的一个越权请求，需要你确认",
-        },
-      }));
-    }
+    const resp = evaluateHookInput(input);
+    if (resp) console.log(JSON.stringify(resp));
   } catch {
     // 读不懂输入就不干预，不影响其他命令。
   }

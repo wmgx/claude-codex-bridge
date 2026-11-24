@@ -7,6 +7,7 @@ import { out, sleep } from "./out";
 import {
   type Backend,
   type PendingApprovalSummary,
+  type ProgressSummary,
   appendEvent,
   releaseWatcher,
   takeDecision,
@@ -263,7 +264,7 @@ export class Session {
     }
   }
 
-  private saveStatus(daemon: "up" | "reconnecting" | "down", thread?: string, ready = true) {
+  private saveStatus(daemon: "up" | "reconnecting" | "down", thread?: string, ready = true, progress?: ProgressSummary) {
     const pendingApprovals = [...this.approvals.values()].map(a => a.summary);
     writeStatus(this.threadId, {
       backend: this.backend,
@@ -272,6 +273,7 @@ export class Session {
       activeTurnId: this.activeTurnId,
       ready,
       ...(pendingApprovals.length ? { pendingApprovals } : {}),
+      ...(progress ? { progress } : {}),
     });
   }
 
@@ -306,7 +308,7 @@ export class Session {
       const { thread } = await this.client.request("thread/read", { threadId: this.threadId, includeTurns: false }, 8000);
       const status = thread?.status?.type as string | undefined;
       if (status === "notLoaded" || status === "systemError") this.lost(status, thread?.status?.detail);
-      this.saveStatus("up", status);
+      this.saveStatus("up", status, true, thread?.progress);
     } catch { this.client.close(); }
   }
 

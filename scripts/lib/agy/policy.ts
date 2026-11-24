@@ -50,10 +50,16 @@ export function loadUserPolicy(): UserPolicyConfig {
 
 // 从 ACP session/request_permission 规范提取工具类别、命令文本和目标路径。
 export function normalizePermission(req: AcpPermissionRequest): NormalizedPermission {
-  const tc = req.toolCall ?? {};
-  const rawInput = (tc.rawInput && typeof tc.rawInput === "object" ? tc.rawInput : {}) as Record<string, unknown>;
+  const tc = (req.toolCall ?? {}) as any;
+  const rawInput = (
+    tc.rawInput && typeof tc.rawInput === "object"
+      ? tc.rawInput
+      : tc.args && typeof tc.args === "object"
+        ? tc.args
+        : {}
+  ) as Record<string, unknown>;
   const rawKind = String(tc.kind ?? "").toLowerCase();
-  const title = String(tc.title ?? rawKind ?? "tool");
+  const title = String(tc.title ?? tc.name ?? rawKind ?? "tool");
 
   const commandCandidate =
     typeof rawInput.command === "string"
@@ -70,7 +76,7 @@ export function normalizePermission(req: AcpPermissionRequest): NormalizedPermis
       if (typeof l?.path === "string" && l.path) locSet.add(l.path);
     }
   }
-  for (const key of ["path", "filepath", "file_path", "filePath", "target", "TargetFile", "directory", "cwd"]) {
+  for (const key of ["path", "Path", "filepath", "file_path", "filePath", "target", "TargetFile", "directory", "cwd"]) {
     const v = rawInput[key];
     if (typeof v === "string" && v) locSet.add(v);
   }

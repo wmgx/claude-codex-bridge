@@ -80,7 +80,17 @@ export function buildAgySpawnSpec(opts: AgySpawnOptions): { cmd: string[]; env: 
   return { cmd, env, sandboxed: !allowUnsandboxed };
 }
 
-// 从流式 session/update 中提取最终汇报：过滤 agent_thought_chunk，优先取最后一次工具调用后的最终消息段。
+export type TurnProgress = {
+  toolCalls: number;
+  lastTool?: string;
+  lastToolStatus?: string;
+  tokensUsed?: number;
+  tokenLimit?: number;
+  updatedAt: string;
+};
+
+// 从流式 session/update 中提取最终汇报：过滤 agent_thought_chunk，优先取最后一次工具调用后的最终消息段，
+// 同时实时累计工具步数与 token 用量供 status 观测长跑任务进度。
 export class TurnAccumulator {
   private allText = "";
   private segmentText = "";
@@ -88,6 +98,12 @@ export class TurnAccumulator {
   actualModel?: string;
   currentModeId?: string;
   readonly toolCalls: Array<{ id?: string; title?: string; kind?: string; status?: string }> = [];
+  private seenToolIds = new Set<string>();
+  private lastTool?: string;
+  private lastToolStatus?: string;
+  private tokensUsed?: number;
+  private tokenLimit?: number;
+  private lastProgressAt = new Date().toISOString();
 
   feed(update: any) {
     if (!update || typeof update !== "object") return;
@@ -100,6 +116,12 @@ export class TurnAccumulator {
       this.currentModeId = update.currentModeId;
       return;
     }
+    if (kind === "usage_update") {
+      if (typeof update.used === "number") this.tokensUsed = update.used;
+      if (typeof update.size === "number") this.tokenLimit = update.size;
+      this.lastProgressAt = new Date().toISOString();
+      return;
+    }
     if (kind === "agent_thought_chunk") return;
     if (kind === "agent_message_chunk") {
       const chunk = extractTextChunk(update.content ?? update);
@@ -110,19 +132,37 @@ export class TurnAccumulator {
       }
       this.allText += chunk;
       this.segmentText += chunk;
+      this.lastProgressAt = new Date().toISOString();
       return;
     }
     if (kind === "tool_call" || kind === "tool_call_update") {
       if (this.segmentText.trim()) this.sawToolAfterText = true;
-      if (kind === "tool_call") {
+      const id = typeof update.toolCallId === "string" ? update.toolCallId : undefined;
+      const label = [update.name, update.title].filter(Boolean).join(": ").slice(0, 120) || update.kind || "tool";
+      this.lastTool = label;
+      if (typeof update.status === "string") this.lastToolStatus = update.status;
+      this.lastProgressAt = new Date().toISOString();
+      if (kind === "tool_call" && (!id || !this.seenToolIds.has(id))) {
+        if (id) this.seenToolIds.add(id);
         this.toolCalls.push({
-          id: update.toolCallId,
+          id,
           title: update.title,
           kind: update.kind,
           status: update.status,
         });
       }
     }
+  }
+
+  progress(): TurnProgress {
+    return {
+      toolCalls: this.toolCalls.length,
+      ...(this.lastTool ? { lastTool: this.lastTool } : {}),
+      ...(this.lastToolStatus ? { lastToolStatus: this.lastToolStatus } : {}),
+      ...(this.tokensUsed !== undefined ? { tokensUsed: this.tokensUsed } : {}),
+      ...(this.tokenLimit !== undefined ? { tokenLimit: this.tokenLimit } : {}),
+      updatedAt: this.lastProgressAt,
+    };
   }
 
   finalText(): string {
@@ -482,6 +522,15 @@ export class AcpClient {
 
   cancel(sessionId: string) {
     if (!this.exited) this.notify("session/cancel", { sessionId });
+  }
+
+  async closeSession(sessionId: string, timeoutMs = 5_000) {
+    if (this.exited) return;
+    try {
+      await this.request("session/close", { sessionId }, timeoutMs);
+    } catch {
+      // 旧版或 mock ACP 可能未实现 session/close，静默忽略
+    }
   }
 
   kill() {

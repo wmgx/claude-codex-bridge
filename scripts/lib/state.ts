@@ -2,7 +2,7 @@
 // 审批请求只能在持有订阅的那条连接上回复，所以 `approve` / `deny` 命令把决定写成文件，
 // 由正在监听的进程读到后再回复 daemon。
 
-import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -107,6 +107,15 @@ export type PendingApprovalSummary = {
   reason?: string;
 };
 
+export type ProgressSummary = {
+  toolCalls: number;
+  lastTool?: string;
+  lastToolStatus?: string;
+  tokensUsed?: number;
+  tokenLimit?: number;
+  updatedAt: string;
+};
+
 // 监听进程每次探活后写一份：Claude / Antigravity 随时能用 `status` 查到执行端是否还活着及待审请求。
 export type Status = {
   pid: number;
@@ -117,6 +126,7 @@ export type Status = {
   backend?: Backend;
   ready?: boolean;
   pendingApprovals?: PendingApprovalSummary[];
+  progress?: ProgressSummary;
 };
 
 export function writeStatus(threadId: string, s: Omit<Status, "pid" | "updatedAt">) {
@@ -225,4 +235,106 @@ export function findRegisteredThreads(ref: string, backend?: Backend): ThreadRec
   const exact = list.filter(r => r.name === ref);
   if (exact.length > 0) return exact;
   return list.filter(r => typeof r.name === "string" && r.name.includes(ref));
+}
+
+export type GcResult = {
+  dryRun: boolean;
+  days: number;
+  cleanedThreads: string[];
+  removedAgyThreads: string[];
+  removedLogs: string[];
+  prunedRegistry: string[];
+};
+
+function newestMtimeInDir(dirPath: string): number {
+  let max = statSync(dirPath).mtimeMs;
+  try {
+    for (const entry of readdirSync(dirPath)) {
+      try {
+        const m = statSync(join(dirPath, entry)).mtimeMs;
+        if (m > max) max = m;
+      } catch {}
+    }
+  } catch {}
+  return max;
+}
+
+// 清理超过指定天数且无活跃监听/活跃轮次的旧线程状态目录、agy 持久化文件与日志。
+export function gcState(opts: { days?: number; dryRun?: boolean; nowMs?: number } = {}): GcResult {
+  const days = opts.days ?? 14;
+  const dryRun = Boolean(opts.dryRun);
+  const now = opts.nowMs ?? Date.now();
+  const cutoff = now - days * 86_400_000;
+
+  const cleanedThreads: string[] = [];
+  const removedAgyThreads: string[] = [];
+  const removedLogs: string[] = [];
+  const prunedRegistry: string[] = [];
+
+  const base = stateBase();
+  const reserved = new Set(["agy", "threads.json", "agy-daemon.sock"]);
+
+  if (existsSync(base)) {
+    for (const name of readdirSync(base)) {
+      if (reserved.has(name) || name.endsWith(".tmp")) continue;
+      const full = join(base, name);
+      try {
+        if (!statSync(full).isDirectory()) continue;
+        if (watcherPid(name) !== undefined) continue;
+        if (newestMtimeInDir(full) >= cutoff) continue;
+        cleanedThreads.push(name);
+        if (!dryRun) rmSync(full, { recursive: true, force: true });
+      } catch {}
+    }
+  }
+
+  const agyThreadsDir = join(agyStateDir(), "threads");
+  if (existsSync(agyThreadsDir)) {
+    for (const f of readdirSync(agyThreadsDir)) {
+      if (!f.endsWith(".json")) continue;
+      const full = join(agyThreadsDir, f);
+      try {
+        const st = statSync(full);
+        const parsed = JSON.parse(readFileSync(full, "utf8"));
+        const id = String(parsed?.id ?? f.slice(0, -5));
+        if (parsed?.status?.type === "active" || watcherPid(id) !== undefined) continue;
+        const updatedMs = typeof parsed?.updatedAt === "number" ? parsed.updatedAt * 1000 : st.mtimeMs;
+        if (Math.max(updatedMs, st.mtimeMs) >= cutoff) continue;
+        removedAgyThreads.push(id);
+        if (!dryRun) rmSync(full, { force: true });
+      } catch {}
+    }
+  }
+
+  const agyLogsDir = join(agyStateDir(), "logs");
+  if (existsSync(agyLogsDir)) {
+    for (const f of readdirSync(agyLogsDir)) {
+      if (!f.endsWith(".log") || f === "shared-acp.log") continue;
+      const full = join(agyLogsDir, f);
+      try {
+        if (statSync(full).mtimeMs >= cutoff) continue;
+        removedLogs.push(f);
+        if (!dryRun) rmSync(full, { force: true });
+      } catch {}
+    }
+  }
+
+  const reg = readRegistryMap();
+  const cleanedSet = new Set([...cleanedThreads, ...removedAgyThreads]);
+  let regChanged = false;
+  for (const [id, rec] of Object.entries(reg)) {
+    if (watcherPid(id) !== undefined) continue;
+    const updatedMs = Date.parse(rec.updatedAt);
+    const expired = Number.isFinite(updatedMs) && updatedMs < cutoff;
+    if (cleanedSet.has(safe(id)) || cleanedSet.has(id) || (expired && !existsSync(dir(id)))) {
+      prunedRegistry.push(id);
+      delete reg[id];
+      regChanged = true;
+    }
+  }
+  if (regChanged && !dryRun) {
+    writeAtomic(registryFile(), JSON.stringify(reg, null, 2));
+  }
+
+  return { dryRun, days, cleanedThreads, removedAgyThreads, removedLogs, prunedRegistry };
 }

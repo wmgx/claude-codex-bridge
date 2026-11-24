@@ -11,7 +11,7 @@
 | 执行端 | 参数 | 底层机制 | 长跑保活（跨 30 分钟 Monitor） | 实时旁观 (`observe`) |
 |---|---|---|---|---|
 | **Codex**（默认） | `--agent codex` | Codex 官方 `app-server daemon`（Unix socket） | 原生支持 | 支持（`codex resume <ID> --remote unix://`） |
-| **Antigravity (`agy`)** | `--agent agy` | 自建常驻 `agy-daemon`（Unix socket）托管 `agy acp --sandbox` | 支持（含 `watch` 补发轮次与挂起审批） | 不提供 |
+| **Antigravity (`agy`)** | `--agent agy` | 自建常驻 `agy-daemon`（Unix socket）单进程多 `sessionId` 复用 `agy acp --sandbox` | 支持（含 `watch` 补发轮次与挂起审批） | 不提供 |
 
 ## 命令
 
@@ -21,13 +21,15 @@
 | `watch <thread> [--agent codex\|agy] [--max-quiet M] [--idle-exit M] [--once] [--timeout S]` | 重新订阅已有线程的事件；补发上次上报之后完成的轮次，已上报的不重放 |
 | `send <thread> <text> [--agent codex\|agy] [--model X] [--effort E] [--wait] [--timeout S]` | 在同一线程继续发一轮；加 `--wait` 自动确保后台监听并等到下一条事件即退出 |
 | `wait <thread> [--agent codex\|agy] [--timeout S]` | 等待线程的下一条需处理事件（如 `approve` 后继续等 `turn_completed`）并立刻退出 |
+| `cancel <thread> [--agent codex\|agy]` | 中断该线程当前正在运行的轮次（Codex `turn/interrupt` / `agy` `session/cancel`） |
 | `stop <thread> [--agent codex\|agy]` | 停止线程的后台监听进程（不删除线程历史） |
 | `approve <thread> <id> [--session]` / `deny <thread> <id>` | 回应审批请求 |
-| `status <thread> [--agent codex\|agy]` | 查执行端是否还活着：返回 `agent`、`ok`、`problems`、`daemon`、`thread` 状态、`running`、监听进程 pid 及 `pendingApprovals`。只读，不会拉起 daemon |
+| `status <thread> [--agent codex\|agy]` | 查执行端是否还活着：返回 `agent`、`ok`、`problems`、`daemon`、`thread` 状态、`running`、监听进程 pid、`pendingApprovals` 与实时 `progress`。只读，不会拉起 daemon |
 | `models [--agent codex\|agy\|all]` | 列出可选模型，以及每个模型支持的思考深度（`efforts`）和默认值 |
 | `list [--agent codex\|agy\|all]` | 列出 claude-codex-bridge 开过的线程（默认聚合两个后端） |
 | `history <thread> [--limit N]` | 最近几轮的提问与汇报 |
 | `rename <thread> <name>` | 改名 |
+| `gc [--days N] [--dry-run]` | 清理超过 `N` 天（默认 14）且无活跃监听/轮次的旧状态目录与日志 |
 | `daemon stop <codex\|agy>` | 停止指定执行端的本地常驻 daemon |
 | `doctor [--agent codex\|agy\|all]` | 检查依赖与沙箱就绪状态 |
 
@@ -109,7 +111,7 @@ Claude 每被唤醒一次，它的 prompt 缓存有效期就从头算。静默�
 - 连接断开自动重连（指数退避，最长 15 秒一次，10 分钟放弃）。重连成功不上报，放弃时输出 `closed`。
 - 每 30 秒探活一次，连接静默死掉也能发现。
 - 最后上报到哪一轮记在状态目录里。重连或重新 `watch` 后，补发这之后完成的所有轮次，不重复上报。
-- `agy-daemon` 在 Monitor 换班空档期间会保留挂起中的审批请求，新 `watch` 连上后立即补推，避免审批丢失；线程空闲 2 小时回收子进程（下次 `send` 自动 `session/resume` / `session/load`），全空载 4 小时自动退出。
+- `agy-daemon` 采用单进程多 `sessionId` 复用 `agy acp --sandbox`（后续开线程无需重复冷启动），并在 Monitor 换班空档期间保留挂起中的审批请求，新 `watch` 连上后立即补推；单个线程空闲 2 小时通过 `session/close` 回收内存（下次 `send` 自动 `session/resume` / `session/load`），全空载 4 小时 daemon 自动退出。
 
 ## 安装
 
@@ -122,11 +124,17 @@ Claude 每被唤醒一次，它的 prompt 缓存有效期就从头算。静默�
 
 **2. 安装插件**
 
-在 Claude Code 里添加本仓库为插件市场并安装，然后重启 Claude Code：
+- **Claude Code**：添加本仓库为插件市场并安装，然后重启 Claude Code：
 
 ```
 /plugin marketplace add wmgx/claude-codex-bridge
 /plugin install claude-codex-bridge
+```
+
+- **Antigravity（全局给任意仓库的 Codex 派活）**：克隆本仓库后运行一键安装脚本，将在 `~/.gemini/config/plugins/codex-bridge/` 生成 `plugin.json`、`delegate-codex` skill 与 `force_ask` 审批护栏 hook：
+
+```bash
+bun scripts/install-agy-plugin.ts
 ```
 
 **3. 自检**
@@ -146,7 +154,7 @@ Claude 每被唤醒一次，它的 prompt 缓存有效期就从头算。静默�
 ## 安全
 
 - 只连本机 Unix socket（目录 `0700`、socket/文件 `0600`），不监听 TCP 端口、不读写凭据。
-- **批准必须经用户确认**：插件带一个 `PreToolUse` hook（`hooks/hooks.json` + `scripts/approve-guard.ts`），词法级识别 `bridge.ts ... approve`（覆盖前置 `--agent`、`sh -c`、`$()`/`eval` 包装，同时不误拦 `deny` 和 `send` 正文里的 `approve` 字样），强制弹出确认。
+- **批准必须经用户确认**：[scripts/approve-guard.ts](scripts/approve-guard.ts) 同时兼容 Claude Code（`hooks/hooks.json`，返回 `ask`）与 Antigravity（`codex-bridge` 插件 `hooks.json`，返回 `force_ask` 忽略 Always Allow 缓存），词法级识别 `bridge.ts ... approve`（覆盖前置 `--agent`、`sh -c`、`$()`/`eval` 包装，同时不误拦 `deny` 和 `send` 正文里的 `approve` 字样），强制弹出确认。
 - 新的审批请求登记时会先丢弃同 ID 的残留决定，过期的批准不会落到别的请求上。
 - 执行端的汇报是它的自述，Claude 应自己核对 diff 和测试，不要直接采信。
 
@@ -154,7 +162,7 @@ Claude 每被唤醒一次，它的 prompt 缓存有效期就从头算。静默�
 
 - Codex 依赖实验性的 app-server 协议（已测 Codex CLI 0.166.0 / daemon 0.167.0）；`agy` 依赖 `agy acp` 协议（已测 `agy 1.5.15`），CLI 升级后可能需要跟进适配。
 - Monitor 最长 30 分钟，长任务到期后用 `watch` 续上。
-- 单元测试（`bun test`）共 26 项，覆盖护栏、一次性等待与审批不断链、策略引擎、fail-closed 自审核、`Session` 状态机以及基于真实子进程模拟 ACP 的全链路测试；真实端到端已测 `agy 1.5.15` 与 `Codex CLI 0.166.0`。
+- 单元测试（`bun test`）共 30 项，覆盖双宿主护栏、一次性等待与审批不断链、单进程多路复用、`cancel`/实时进度、`gc`、策略引擎、fail-closed 自审核与 `Session` 状态机；真实端到端已测 `agy 1.5.15`（含真实 `session/request_permission`、复用与取消）及 `Codex CLI 0.166.0`。
 
 ## License
 

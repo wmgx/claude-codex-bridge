@@ -1,5 +1,6 @@
 // agy-daemon 核心协议与线程生命周期管理器（与 WebSocket 传输层解耦，便于单元测试）。
-// 对外暴露与 Codex app-server 同构的 JSON-RPC 子集，对内托管 `agy acp --sandbox` 子进程。
+// 对外暴露与 Codex app-server 同构的 JSON-RPC 子集，对内单进程多 sessionId 复用 `agy acp --sandbox`，
+// 把后续新开线程和模型查询的冷启动耗时从 ~12s 压到 < 1s。
 
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
@@ -13,6 +14,7 @@ import {
   type AcpSessionInfo,
   type AgyModelCatalogEntry,
   TurnAccumulator,
+  type TurnProgress,
   buildAgySpawnSpec,
   buildModelCatalog,
   diagnoseAgyStderr,
@@ -50,6 +52,12 @@ type EscalatedApproval = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+type SharedAcpHost = {
+  acp: AcpClient;
+  sandboxed: boolean;
+  ready: Promise<void>;
+};
+
 type ThreadRuntime = {
   threadId: string;
   acp: AcpClient;
@@ -64,21 +72,23 @@ type ThreadRuntime = {
 export type DaemonCoreOptions = {
   reviewer?: ReviewerFn;
   userPolicy?: () => UserPolicyConfig;
-  spawnAcp?: (cwd: string) => { acp: AcpClient; sandboxed: boolean };
+  spawnAcp?: (cwd: string, logTag?: string) => { acp: AcpClient; sandboxed: boolean };
   onShutdown?: () => void;
   threadIdleMs?: number;
   daemonIdleMs?: number;
   approvalTimeoutMs?: number;
 };
 
-const DEFAULT_THREAD_IDLE_MS = 2 * 60 * 60_000; // 2 小时无活动回收子进程（保留磁盘状态，下次 send 自动恢复）
+const DEFAULT_THREAD_IDLE_MS = 2 * 60 * 60_000; // 2 小时无活动关闭该 session（保留磁盘状态，下次 send 自动 resume）
 const DEFAULT_DAEMON_IDLE_MS = 4 * 60 * 60_000; // 4 小时全空载自动退出
 const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60_000;
 
 export class AgyDaemonCore {
   private peers = new Map<string, DaemonPeer>();
   private subscribers = new Map<string, Set<string>>(); // threadId -> peerIds
-  private runtimes = new Map<string, ThreadRuntime>();
+  private sharedHost?: SharedAcpHost;
+  private runtimes = new Map<string, ThreadRuntime>(); // threadId -> runtime
+  private sessionToThread = new Map<string, string>(); // acpSessionId -> threadId
   private approvalSeq = 0;
   private cachedModels?: AgyModelCatalogEntry[];
   private lastDaemonActivityAt = Date.now();
@@ -114,7 +124,7 @@ export class AgyDaemonCore {
 
   startSweep(intervalMs = 60_000) {
     if (this.sweepTimer) return;
-    this.sweepTimer = setInterval(() => this.sweepIdle(), intervalMs);
+    this.sweepTimer = setInterval(() => void this.sweepIdle(), intervalMs);
     this.sweepTimer.unref?.();
   }
 
@@ -124,9 +134,14 @@ export class AgyDaemonCore {
     for (const rt of this.runtimes.values()) {
       for (const a of rt.pendingApprovals.values()) clearTimeout(a.timer);
       rt.pendingApprovals.clear();
-      rt.acp.kill();
     }
     this.runtimes.clear();
+    this.sessionToThread.clear();
+    if (this.sharedHost) {
+      const host = this.sharedHost;
+      this.sharedHost = undefined;
+      host.acp.kill();
+    }
   }
 
   registerPeer(peer: DaemonPeer) {
@@ -159,6 +174,35 @@ export class AgyDaemonCore {
     }
   }
 
+  // 单进程多路复用：所有 session 共用同一个已初始化的 agy acp --sandbox 进程，避免重复冷启动。
+  private async ensureSharedHost(cwd: string): Promise<SharedAcpHost> {
+    if (this.sharedHost && this.sharedHost.acp.alive) {
+      await this.sharedHost.ready;
+      return this.sharedHost;
+    }
+    const { acp, sandboxed } = this.spawnAcpFn(cwd, "shared-acp");
+    const host: SharedAcpHost = {
+      acp,
+      sandboxed,
+      ready: acp.initialize(20_000).then(() => {}),
+    };
+    this.sharedHost = host;
+
+    acp.onNotification = (m, p) => this.routeAcpNotification(m, p);
+    acp.onPermissionRequest = req => void this.routeAcpPermissionRequest(req);
+    acp.onUnknownRequest = (reqId, m) => acp.respondError(reqId, -32601, `agy-bridge-daemon 不支持请求 ${m}`);
+    acp.onExit = (code, stderrTail) => this.onSharedAcpExit(host, code, stderrTail);
+
+    try {
+      await host.ready;
+      return host;
+    } catch (e) {
+      if (this.sharedHost === host) this.sharedHost = undefined;
+      acp.kill();
+      throw e;
+    }
+  }
+
   async handleMessage(peer: DaemonPeer, msg: any) {
     this.lastDaemonActivityAt = Date.now();
     if (!msg || typeof msg !== "object") return;
@@ -174,7 +218,6 @@ export class AgyDaemonCore {
       return;
     }
 
-    // RPC 请求
     const id = msg.id;
     try {
       const result = await this.dispatchRpc(peer, msg.method, msg.params ?? {});
@@ -197,27 +240,14 @@ export class AgyDaemonCore {
       }, 20);
       return { ok: true };
     }
-    if (method === "thread/start") {
-      return this.rpcThreadStart(peer, params);
-    }
-    if (method === "thread/name/set") {
-      return this.rpcThreadNameSet(params);
-    }
-    if (method === "thread/resume") {
-      return this.rpcThreadResume(peer, params);
-    }
-    if (method === "thread/read") {
-      return this.rpcThreadRead(params);
-    }
-    if (method === "thread/list") {
-      return this.rpcThreadList(params);
-    }
-    if (method === "turn/start") {
-      return this.rpcTurnStart(params);
-    }
-    if (method === "model/list") {
-      return this.rpcModelList();
-    }
+    if (method === "thread/start") return this.rpcThreadStart(peer, params);
+    if (method === "thread/name/set") return this.rpcThreadNameSet(params);
+    if (method === "thread/resume") return this.rpcThreadResume(peer, params);
+    if (method === "thread/read") return this.rpcThreadRead(params);
+    if (method === "thread/list") return this.rpcThreadList(params);
+    if (method === "turn/start") return this.rpcTurnStart(params);
+    if (method === "turn/interrupt") return this.rpcTurnInterrupt(params);
+    if (method === "model/list") return this.rpcModelList();
     throw new BridgeError(`agy-daemon 不支持方法 ${method}`);
   }
 
@@ -227,8 +257,8 @@ export class AgyDaemonCore {
   }
 
   private async bootRuntime(stored: StoredAgyThread, isResume: boolean): Promise<ThreadRuntime> {
-    const { acp, sandboxed } = this.spawnAcpFn(stored.cwd, stored.id);
-    await acp.initialize();
+    const host = await this.ensureSharedHost(stored.cwd);
+    const { acp, sandboxed } = host;
 
     let sessionInfo: AcpSessionInfo;
     if (isResume && stored.acpSessionId) {
@@ -238,7 +268,6 @@ export class AgyDaemonCore {
     }
     this.cacheModelsFromSession(sessionInfo);
 
-    // 优先激活 agy 原生 auto 模式（沙箱内自动放行 + 越界自动审查），不支持时回退 accept-edits。
     const nativeAutoActive = await this.negotiateMode(acp, sessionInfo);
 
     if (stored.model) {
@@ -263,12 +292,10 @@ export class AgyDaemonCore {
       lastActivityAt: Date.now(),
     };
 
-    acp.onNotification = (m, p) => this.onAcpNotification(rt, m, p);
-    acp.onPermissionRequest = req => void this.onAcpPermissionRequest(rt, req);
-    acp.onUnknownRequest = (reqId, m) => acp.respondError(reqId, -32601, `agy-bridge-daemon 不支持请求 ${m}`);
-    acp.onExit = (code, stderrTail) => this.onAcpExit(rt, code, stderrTail);
-
     this.runtimes.set(stored.id, rt);
+    if (sessionInfo.sessionId) {
+      this.sessionToThread.set(sessionInfo.sessionId, stored.id);
+    }
     return rt;
   }
 
@@ -282,9 +309,7 @@ export class AgyDaemonCore {
         await acp.setMode(info.sessionId, "auto", modeOpt);
         info.currentModeId = "auto";
         return true;
-      } catch {
-        // 账号或平台不支持 auto 时降级到 accept-edits
-      }
+      } catch {}
     }
     if (ids.has("accept-edits") && info.currentModeId !== "accept-edits") {
       try {
@@ -311,6 +336,11 @@ export class AgyDaemonCore {
     }
     await acp.setConfigOption(info.sessionId, effortOpt.id, effort);
     effortOpt.currentValue = effort;
+  }
+
+  private liveProgressOf(threadId: string): TurnProgress | undefined {
+    const rt = this.runtimes.get(threadId);
+    return rt?.activeTurn?.acc.progress();
   }
 
   private async rpcThreadStart(peer: DaemonPeer, params: any) {
@@ -356,7 +386,6 @@ export class AgyDaemonCore {
     if (!stored) throw new BridgeError(`找不到 agy 线程 ${threadId}`);
     this.subscribe(threadId, peer.id);
 
-    // 若 Monitor 换班空档期间有仍未决的人工审批，新 watch 挂上后立即补推，避免丢审批。
     const rt = this.runtimes.get(threadId);
     if (rt && rt.pendingApprovals.size > 0) {
       queueMicrotask(() => {
@@ -365,14 +394,21 @@ export class AgyDaemonCore {
         }
       });
     }
-    return { thread: toBridgeThreadShape(stored, false) };
+    const progress = this.liveProgressOf(threadId);
+    return { thread: { ...toBridgeThreadShape(stored, false), ...(progress ? { progress } : {}) } };
   }
 
   private rpcThreadRead(params: any) {
     const threadId = String(params.threadId ?? "");
     const stored = loadAgyThread(threadId);
     if (!stored) throw new BridgeError(`找不到 agy 线程 ${threadId}`);
-    return { thread: toBridgeThreadShape(stored, Boolean(params.includeTurns)) };
+    const progress = this.liveProgressOf(threadId);
+    return {
+      thread: {
+        ...toBridgeThreadShape(stored, Boolean(params.includeTurns)),
+        ...(progress ? { progress } : {}),
+      },
+    };
   }
 
   private rpcThreadList(params: any) {
@@ -392,7 +428,7 @@ export class AgyDaemonCore {
 
     let rt = this.runtimes.get(threadId);
     if (rt?.activeTurn) {
-      throw new BridgeError("该线程当前已有轮次正在运行，请等待本轮结束后再发送");
+      throw new BridgeError("该线程当前已有轮次正在运行，请等待本轮结束后再发送（或先 `bridge cancel` 中断）");
     }
 
     const text = Array.isArray(params.input)
@@ -400,7 +436,6 @@ export class AgyDaemonCore {
       : String(params.text ?? "");
     if (!text.trim()) throw new BridgeError("消息文本为空");
 
-    // 按需恢复空闲回收或崩溃退出后的 ACP 子进程
     if (!rt || !rt.acp.alive) {
       rt = await this.bootRuntime(stored, Boolean(stored.acpSessionId));
     }
@@ -434,9 +469,26 @@ export class AgyDaemonCore {
 
     this.broadcast(threadId, { method: "turn/started", params: { threadId, turn: { id: turnId } } });
 
-    // 异步驱动 ACP session/prompt，让 turn/start RPC 立即返回（与 Codex 行为一致）
     void this.runTurnPrompt(rt, stored, turn, acc, text);
     return { turn: { id: turnId } };
+  }
+
+  private rpcTurnInterrupt(params: any) {
+    const threadId = String(params.threadId ?? "");
+    const rt = this.runtimes.get(threadId);
+    if (!rt || !rt.activeTurn) {
+      return { interrupted: false, detail: "当前没有正在运行的轮次" };
+    }
+    const turnId = rt.activeTurn.turn.id;
+    // 先释放该线程上所有挂起审批，避免 agy 卡在等待审批无法响应 cancel
+    for (const [rpcId, pending] of rt.pendingApprovals) {
+      clearTimeout(pending.timer);
+      rt.pendingApprovals.delete(rpcId);
+      rt.acp.respond(pending.acpReq.id, { outcome: { outcome: "cancelled" } });
+    }
+    rt.acp.cancel(rt.sessionInfo.sessionId);
+    rt.lastActivityAt = Date.now();
+    return { interrupted: true, turnId };
   }
 
   private async runTurnPrompt(
@@ -503,9 +555,19 @@ export class AgyDaemonCore {
     }
   }
 
-  private onAcpNotification(rt: ThreadRuntime, method: string, params: any) {
-    rt.lastActivityAt = Date.now();
+  private findRuntimeBySession(sessionId: string): ThreadRuntime | undefined {
+    const tid = this.sessionToThread.get(sessionId);
+    if (tid) return this.runtimes.get(tid);
+    // 兜底：若仅有一个活跃 runtime，避免某些 ACP 通知漏带 sessionId
+    if (!sessionId && this.runtimes.size === 1) return this.runtimes.values().next().value;
+    return undefined;
+  }
+
+  private routeAcpNotification(method: string, params: any) {
     if (method !== "session/update") return;
+    const rt = this.findRuntimeBySession(String(params?.sessionId ?? ""));
+    if (!rt) return;
+    rt.lastActivityAt = Date.now();
     const update = params?.update ?? params;
     if (rt.activeTurn) rt.activeTurn.acc.feed(update);
     const kind = update?.sessionUpdate ?? update?.type;
@@ -517,6 +579,15 @@ export class AgyDaemonCore {
         saveAgyThread(stored);
       }
     }
+  }
+
+  private async routeAcpPermissionRequest(req: AcpPermissionRequest) {
+    const rt = this.findRuntimeBySession(req.sessionId);
+    if (!rt) {
+      this.sharedHost?.acp.respond(req.id, { outcome: { outcome: "cancelled" } });
+      return;
+    }
+    await this.onAcpPermissionRequest(rt, req);
   }
 
   private async onAcpPermissionRequest(rt: ThreadRuntime, req: AcpPermissionRequest) {
@@ -602,7 +673,6 @@ export class AgyDaemonCore {
       });
     }
 
-    // 升级给用户确认（映射成 Codex 同构审批事件，由 Session -> Claude -> 用户 -> approve-guard 完成闭环）
     const rpcId = ++this.approvalSeq;
     const isFile = norm.kind === "fileChange";
     const method: EscalatedApproval["method"] = isFile
@@ -665,51 +735,51 @@ export class AgyDaemonCore {
     }
   }
 
-  private onAcpExit(rt: ThreadRuntime, code: number | null, stderrTail: string) {
-    if (this.runtimes.get(rt.threadId) === rt) {
+  private onSharedAcpExit(host: SharedAcpHost, code: number | null, stderrTail: string) {
+    if (this.sharedHost === host) this.sharedHost = undefined;
+
+    const affected = [...this.runtimes.values()].filter(rt => rt.acp === host.acp);
+    for (const rt of affected) {
       this.runtimes.delete(rt.threadId);
-    }
-    for (const a of rt.pendingApprovals.values()) clearTimeout(a.timer);
-    rt.pendingApprovals.clear();
+      if (rt.sessionInfo.sessionId) this.sessionToThread.delete(rt.sessionInfo.sessionId);
+      for (const a of rt.pendingApprovals.values()) clearTimeout(a.timer);
+      rt.pendingApprovals.clear();
 
-    const stored = loadAgyThread(rt.threadId);
-    if (!stored) return;
+      const stored = loadAgyThread(rt.threadId);
+      if (!stored) continue;
 
-    if (rt.activeTurn) {
-      const { turn, acc } = rt.activeTurn;
-      rt.activeTurn = undefined;
-      const hint = diagnoseAgyStderr(stderrTail);
-      const detail = `agy acp 异常退出 (code ${code ?? "null"})${hint ? `：${hint}` : stderrTail ? `：${stderrTail.split("\n").at(-1)}` : ""}`;
-      turn.report = acc.finalText();
-      turn.status = "failed";
-      turn.errorDetail = detail;
-      turn.completedAt = new Date().toISOString();
-      stored.status = { type: "systemError", detail };
-      stored.updatedAt = Math.floor(Date.now() / 1000);
-      saveAgyThread(stored);
-      this.broadcast(rt.threadId, {
-        method: "thread/status/changed",
-        params: { threadId: rt.threadId, status: { type: "systemError", detail } },
-      });
-    } else if (stored.status.type !== "systemError") {
-      stored.status = { type: "idle" };
-      stored.updatedAt = Math.floor(Date.now() / 1000);
-      saveAgyThread(stored);
+      if (rt.activeTurn) {
+        const { turn, acc } = rt.activeTurn;
+        rt.activeTurn = undefined;
+        const hint = diagnoseAgyStderr(stderrTail);
+        const detail = `agy acp 异常退出 (code ${code ?? "null"})${hint ? `：${hint}` : stderrTail ? `：${stderrTail.split("\n").at(-1)}` : ""}`;
+        turn.report = acc.finalText();
+        turn.status = "failed";
+        turn.errorDetail = detail;
+        turn.completedAt = new Date().toISOString();
+        stored.status = { type: "systemError", detail };
+        stored.updatedAt = Math.floor(Date.now() / 1000);
+        saveAgyThread(stored);
+        this.broadcast(rt.threadId, {
+          method: "thread/status/changed",
+          params: { threadId: rt.threadId, status: { type: "systemError", detail } },
+        });
+      } else if (stored.status.type !== "systemError") {
+        stored.status = { type: "idle" };
+        stored.updatedAt = Math.floor(Date.now() / 1000);
+        saveAgyThread(stored);
+      }
     }
   }
 
   private async rpcModelList() {
     if (!this.cachedModels) {
-      // 冷启动 agy acp 需拉取 loadCodeAssist + fetchAvailableModels（约 10–30s），预留充裕超时
+      // 复用 sharedHost 探测并保留热进程，下一次 start --agent agy 即可秒开
       try {
-        const { acp } = this.spawnAcpFn(process.cwd(), "model-probe");
-        try {
-          await acp.initialize(20_000);
-          const info = await acp.newSession(process.cwd(), 60_000);
-          this.cacheModelsFromSession(info);
-        } finally {
-          acp.kill();
-        }
+        const host = await this.ensureSharedHost(process.cwd());
+        const info = await host.acp.newSession(process.cwd(), 60_000);
+        this.cacheModelsFromSession(info);
+        if (info.sessionId) await host.acp.closeSession(info.sessionId);
       } catch {}
     }
     if (this.cachedModels?.length) {
@@ -727,13 +797,16 @@ export class AgyDaemonCore {
     };
   }
 
-  private sweepIdle() {
+  private async sweepIdle() {
     const now = Date.now();
     for (const [threadId, rt] of this.runtimes) {
       if (rt.activeTurn || rt.pendingApprovals.size > 0) continue;
       if (now - rt.lastActivityAt > this.threadIdleMs) {
         this.runtimes.delete(threadId);
-        rt.acp.kill();
+        if (rt.sessionInfo.sessionId) {
+          this.sessionToThread.delete(rt.sessionInfo.sessionId);
+          await rt.acp.closeSession(rt.sessionInfo.sessionId);
+        }
       }
     }
     if (this.runtimes.size === 0 && this.peers.size === 0 && now - this.lastDaemonActivityAt > this.daemonIdleMs) {

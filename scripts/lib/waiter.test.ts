@@ -7,7 +7,7 @@ const tempState = mkdtempSync(join(tmpdir(), "bridge-waiter-test-"));
 process.env.XDG_STATE_HOME = tempState;
 
 const { Session } = await import("./session");
-const { appendEvent, readStatus, readWaitCursor, writeDecision } = await import("./state");
+const { appendEvent, gcState, readStatus, readWaitCursor, registerThread, writeDecision, writeLastEmitted } = await import("./state");
 const { stripInternalFields, waitForNextEvent } = await import("./waiter");
 
 const log = spyOn(console, "log").mockImplementation(() => {});
@@ -125,4 +125,36 @@ test("Session idleExitMs 在空闲时触发退出，有活跃轮次时不触发"
   fakeClient.onNotification({ method: "turn/completed", params: { threadId: tid, turn: { id: "t1", status: "completed" } } });
   await Bun.sleep(100);
   expect(exited).toBe(true);
+});
+
+test("gcState 支持 dryRun，仅清理超期旧线程并保留近期线程", async () => {
+  const { utimesSync, existsSync } = await import("node:fs");
+  const { eventsLogPath } = await import("./state");
+
+  const oldId = "gc-old-thread";
+  const freshId = "gc-fresh-thread";
+  writeLastEmitted(oldId, "t1");
+  appendEvent(oldId, { agent: "codex", event: "turn_completed", threadId: oldId });
+  registerThread({ threadId: oldId, backend: "codex", name: "old" });
+
+  writeLastEmitted(freshId, "t1");
+  registerThread({ threadId: freshId, backend: "codex", name: "fresh" });
+
+  // 把 oldId 的文件与目录 mtime 拨回 20 天前
+  const past = new Date(Date.now() - 20 * 86_400_000);
+  const oldDir = join(tempState, "claude-codex-bridge", oldId);
+  utimesSync(eventsLogPath(oldId), past, past);
+  utimesSync(join(oldDir, "last-emitted"), past, past);
+  utimesSync(oldDir, past, past);
+
+  const dry = gcState({ days: 14, dryRun: true });
+  expect(dry.cleanedThreads).toContain(oldId);
+  expect(dry.cleanedThreads).not.toContain(freshId);
+  expect(existsSync(oldDir)).toBe(true);
+
+  const real = gcState({ days: 14, dryRun: false });
+  expect(real.cleanedThreads).toContain(oldId);
+  expect(real.prunedRegistry).toContain(oldId);
+  expect(existsSync(oldDir)).toBe(false);
+  expect(existsSync(join(tempState, "claude-codex-bridge", freshId))).toBe(true);
 });

@@ -26,7 +26,7 @@ description: 把方案交给 Codex 或 Antigravity (agy / Gemini) 执行并在�
 
 ## 查执行端是否还活着
 
-怀疑执行端卡住或挂了，或很久没动静时：`bridge status <线程名或ID>`。`ok:false` 时看 `problems`。监听进程每 30 秒探活并落盘，`watcher` 为 null 说明没有监听进程，用 `watch` 挂上。
+怀疑执行端卡住或挂了，或很久没动静时：`bridge status <线程名或ID>`。`ok:false` 时看 `problems`；运行中还可查看 `progress`（工具步数、最近工具名、token 用量）与 `pendingApprovals`。监听进程每 30 秒探活并落盘，`watcher` 为 null 说明没有监听进程，用 `watch` 挂上。
 
 ## 事件
 
@@ -63,6 +63,8 @@ Codex 旁观命令必须带线程 ID（名字不行），以事件里的 `observ
 ## 其他命令
 
 - `bridge start ... --once` / `bridge send ... --wait` / `bridge wait <线程>` / `bridge stop <线程>`：适用于无 `Monitor` 逐行唤醒的宿主（如 Antigravity）——后台托管监听进程持有审批连接，前台收到下一条需处理事件即退出唤醒。
+- `bridge cancel <线程>`：中断当前正在运行的轮次。
+- `bridge gc [--days N] [--dry-run]`：清理超过 N 天（默认 14）且无活跃监听的旧线程状态与日志。
 - `bridge models [--agent codex|agy|all]`：列出可选模型和各自支持的思考深度。
 - `bridge list [--agent codex|agy|all]`：列出 claude-codex-bridge 开过的线程。
 - `bridge history <线程> [--limit N]`：看最近几轮的提问与汇报。

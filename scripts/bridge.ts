@@ -11,15 +11,17 @@
 //                                      在同一线程继续发一轮；加 --wait 自动确保后台监听并等到下一条事件后退出
 //   wait <thread> [--agent codex|agy] [--timeout S]
 //                                      等待该线程的下一条需处理事件（如审批后继续等 turn_completed）并立刻退出
+//   cancel <thread> [--agent codex|agy] 中断该线程当前正在运行的轮次
 //   stop <thread> [--agent codex|agy]  停止该线程的后台监听进程（不删除线程历史）
 //   （start / send 的 <text> 可以换成 --file <路径>，从文件读，避免长文本的 shell 转义问题）
 //   approve <thread> <requestId> [--session]   同意一个审批请求（--session：本会话内同类免问）
 //   deny <thread> <requestId>          拒绝一个审批请求
-//   status <thread> [--agent codex|agy]查执行端是否还活着：daemon、线程状态、监听进程、待审请求（只读，不拉起 daemon）
+//   status <thread> [--agent codex|agy]查执行端是否还活着：daemon、线程状态、监听进程、待审请求、实时进度（只读，不拉起 daemon）
 //   models [--agent codex|agy|all]     列出可选模型及各自支持的思考深度
 //   list [--agent codex|agy|all]       列出 claude-codex-bridge 开过的线程
 //   history <thread> [--limit N]       看最近几轮的提问与汇报
 //   rename <thread> <name>             改名
+//   gc [--days N] [--dry-run]          清理超过 N 天（默认 14）且无活跃监听的旧状态与日志
 //   daemon stop <codex|agy>            停止指定执行端的本地常驻 daemon
 //
 // <thread> 可以是线程 ID，也可以是 start 时起的名字。
@@ -44,8 +46,10 @@ import { BridgeError, out } from "./lib/out";
 import { Session } from "./lib/session";
 import {
   type Backend,
+  type ProgressSummary,
   claimWatcher,
   findRegisteredThreads,
+  gcState,
   getThreadRecord,
   latestEventSeq,
   readLastEmitted,
@@ -61,6 +65,7 @@ import {
   PREFIX,
   type TurnOptions,
   defaultName,
+  interruptTurn,
   isAgyThreadId,
   isDirectThreadId,
   listModels,
@@ -80,8 +85,8 @@ import {
 
 type Flags = Map<string, string | true>;
 
-const BOOL_FLAGS = new Set(["--session", "--no-network", "--once", "--wait"]);
-const VALUE_FLAGS = new Set(["--agent", "--name", "--limit", "--max-quiet", "--file", "--model", "--effort", "--idle-exit", "--timeout"]);
+const BOOL_FLAGS = new Set(["--session", "--no-network", "--once", "--wait", "--dry-run"]);
+const VALUE_FLAGS = new Set(["--agent", "--name", "--limit", "--max-quiet", "--file", "--model", "--effort", "--idle-exit", "--timeout", "--days"]);
 
 // 允许 flag 出现在子命令前或后，并支持 --flag=value 写法。
 function parseArgs(argv: string[]) {
@@ -290,13 +295,16 @@ async function status(ref: string, explicit?: Backend) {
   const backend = inferred.backend;
   let daemon: "up" | "down" = "down";
   let thread: string | undefined;
+  let liveProgress: ProgressSummary | undefined;
   let threadId = inferred.threadId ?? ref;
 
   if (await backendAlive(backend)) {
     try {
       const c = await Client.connect(backendSocket(backend));
       threadId = inferred.threadId ?? (await resolveThread(c, ref));
-      thread = (await c.request("thread/read", { threadId, includeTurns: false })).thread?.status?.type;
+      const readRes = await c.request("thread/read", { threadId, includeTurns: false });
+      thread = readRes.thread?.status?.type;
+      liveProgress = readRes.thread?.progress;
       c.close();
       daemon = "up";
     } catch (e) {
@@ -311,6 +319,7 @@ async function status(ref: string, explicit?: Backend) {
   const age = saved ? Date.now() - Date.parse(saved.updatedAt) : undefined;
   const watcherStale = !!saved && watcher !== undefined && age! > STATUS_STALE_MS;
   const running = daemon === "up" ? thread === "active" : !!saved?.activeTurnId;
+  const progress = liveProgress ?? (running ? saved?.progress : undefined);
   const problems = [
     daemon === "down" && `${backend} daemon 不在线`,
     thread === "systemError" && "线程处于 systemError",
@@ -331,6 +340,7 @@ async function status(ref: string, explicit?: Backend) {
     watcher: watcher ?? null,
     watcherReport: saved ? { daemon: saved.daemon, updatedAt: saved.updatedAt } : null,
     ...(saved?.pendingApprovals?.length ? { pendingApprovals: saved.pendingApprovals } : {}),
+    ...(progress ? { progress } : {}),
   });
   process.exit(0);
 }
@@ -383,6 +393,14 @@ async function main() {
 
   if (cmd === "doctor") return doctor(flags);
 
+  if (cmd === "gc") {
+    need(0);
+    const days = nonNegNumber(flags, "days", 14, "天");
+    const res = gcState({ days, dryRun: flags.has("dry-run") });
+    out(res);
+    process.exit(0);
+  }
+
   if (cmd === "daemon") {
     need(2);
     if (pos[0] !== "stop") throw new BridgeError("未知 daemon 子命令", "daemon stop <codex|agy>");
@@ -408,6 +426,7 @@ async function main() {
     writeLastEmitted(threadId, null);
     writeWaitCursor(threadId, latestEventSeq(threadId));
     const observe = observeCommand(backend, threadId);
+    const networkDisplay = backend === "agy" ? "sandbox-default" : opts.network;
 
     if (once) {
       // 后台托管 watcher 持续持有 WebSocket 连接（确保审批不掉链），前台等下一条事件即退出。
@@ -422,7 +441,7 @@ async function main() {
         mode: "auto",
         model: opts.model ?? "default",
         effort: opts.effort ?? "default",
-        network: opts.network,
+        network: networkDisplay,
         once: true,
         watcher: pid,
         ...(observe ? { observe } : {}),
@@ -446,7 +465,7 @@ async function main() {
       mode: "auto",
       model: opts.model ?? "default",
       effort: opts.effort ?? "default",
-      network: opts.network,
+      network: networkDisplay,
       maxQuietMinutes: quiet / 60_000,
       ...(observe ? { observe } : {}),
     });
@@ -508,6 +527,15 @@ async function main() {
     }
     await ensureDetachedWatcher(threadId, backend);
     return emitAndExitOnWait(backend, threadId, timeout);
+  }
+
+  if (cmd === "cancel") {
+    need(1);
+    const { backend, client: c, threadId } = await resolveTarget(pos[0], explicitAgent());
+    const res = await interruptTurn(c, threadId, backend);
+    c.close();
+    out({ agent: backend, threadId, ...res });
+    process.exit(0);
   }
 
   if (cmd === "stop") {
@@ -614,7 +642,7 @@ async function main() {
     process.exit(0);
   }
 
-  throw new BridgeError("未知命令", "doctor | start | watch | wait | stop | send | approve | deny | status | models | list | history | rename | daemon stop");
+  throw new BridgeError("未知命令", "doctor | start | watch | wait | cancel | stop | send | approve | deny | status | models | list | history | rename | gc | daemon stop");
 }
 
 main().catch(e => {

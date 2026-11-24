@@ -113,3 +113,20 @@ export async function threadHistory(c: Client, threadId: string, limit: number) 
 
 export const renameThread = (c: Client, threadId: string, name: string) =>
   c.request("thread/name/set", { threadId, name: PREFIX + name });
+
+export async function interruptTurn(
+  c: Client,
+  threadId: string,
+  backend: Backend,
+): Promise<{ interrupted: boolean; turnId?: string; detail?: string }> {
+  if (backend === "agy") {
+    return c.request("turn/interrupt", { threadId }, 15_000);
+  }
+  const { thread } = await c.request("thread/read", { threadId, includeTurns: true }, 15_000);
+  const running = (thread?.turns ?? []).find((t: any) => t.status === "inProgress");
+  if (!running?.id) {
+    return { interrupted: false, detail: "当前没有正在运行的轮次" };
+  }
+  await c.request("turn/interrupt", { threadId, turnId: running.id }, 15_000);
+  return { interrupted: true, turnId: running.id };
+}

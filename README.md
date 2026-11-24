@@ -17,11 +17,13 @@
 
 | 命令 | 作用 |
 |---|---|
-| `start <cwd> <text> [--agent codex\|agy] [--name N] [--max-quiet M] [--model X] [--effort E] [--no-network]` | 开线程，发第一轮，之后持续输出事件。默认 `codex`、默认允许联网 |
-| `watch <thread> [--agent codex\|agy] [--max-quiet M]` | 重新订阅已有线程的事件；补发上次上报之后完成的轮次，已上报的不重放 |
-| `send <thread> <text> [--agent codex\|agy] [--model X] [--effort E]` | 在同一线程继续发一轮，给了模型或思考深度就从这一轮起换；没有监听进程时输出里会带 `watching: false` |
+| `start <cwd> <text> [--agent codex\|agy] [--name N] [--max-quiet M] [--model X] [--effort E] [--no-network] [--once] [--timeout S]` | 开线程，发第一轮；默认持续输出事件（Claude Monitor）；加 `--once` 自动后台托管监听，收到下一条需处理事件即退出 |
+| `watch <thread> [--agent codex\|agy] [--max-quiet M] [--idle-exit M] [--once] [--timeout S]` | 重新订阅已有线程的事件；补发上次上报之后完成的轮次，已上报的不重放 |
+| `send <thread> <text> [--agent codex\|agy] [--model X] [--effort E] [--wait] [--timeout S]` | 在同一线程继续发一轮；加 `--wait` 自动确保后台监听并等到下一条事件即退出 |
+| `wait <thread> [--agent codex\|agy] [--timeout S]` | 等待线程的下一条需处理事件（如 `approve` 后继续等 `turn_completed`）并立刻退出 |
+| `stop <thread> [--agent codex\|agy]` | 停止线程的后台监听进程（不删除线程历史） |
 | `approve <thread> <id> [--session]` / `deny <thread> <id>` | 回应审批请求 |
-| `status <thread> [--agent codex\|agy]` | 查执行端是否还活着：返回 `agent`、`ok`、`problems`、`daemon`、`thread` 状态、`running`、监听进程 pid。只读，不会拉起 daemon |
+| `status <thread> [--agent codex\|agy]` | 查执行端是否还活着：返回 `agent`、`ok`、`problems`、`daemon`、`thread` 状态、`running`、监听进程 pid 及 `pendingApprovals`。只读，不会拉起 daemon |
 | `models [--agent codex\|agy\|all]` | 列出可选模型，以及每个模型支持的思考深度（`efforts`）和默认值 |
 | `list [--agent codex\|agy\|all]` | 列出 claude-codex-bridge 开过的线程（默认聚合两个后端） |
 | `history <thread> [--limit N]` | 最近几轮的提问与汇报 |
@@ -72,6 +74,27 @@
   4. **审计日志**：所有权限决策均按 JSONL 记入 `~/.local/state/claude-codex-bridge/<threadId>/audit.jsonl`（权限 `0600`）。
 
 > **合规与认证提醒**：Google 对个人消费者 OAuth（`oauth-personal`）在第三方外层自动化编排中的使用条款（Antigravity Terms Section 6）限制较严；长期程序化/桥接场景请务必留意账号条款与限流政策。
+
+## 非 Monitor 宿主用法（如 Antigravity）
+
+在没有逐行 stdout 唤醒（`Monitor`）的宿主里（如 Antigravity 后台任务），可使用一次性等待模式，实现零轮询、事件一到立刻退出唤醒，且审批不掉链：
+
+```bash
+# 1. 开线程并等第一条需处理事件（turn_completed / approval_requested / codex_lost）即退出
+bun scripts/bridge.ts start <目录> --file <方案文件> --agent codex --name task-1 --once
+
+# 2. 若返回 approval_requested，经用户确认后 approve，再继续 wait 等本轮结束
+bun scripts/bridge.ts approve task-1 <requestId>
+bun scripts/bridge.ts wait task-1
+
+# 3. 追加指令并等下一条事件即退出
+bun scripts/bridge.ts send task-1 "补充修改 X" --wait
+
+# 4. 任务结束，清理后台托管监听进程（默认空闲 60 分钟也会自动退出）
+bun scripts/bridge.ts stop task-1
+```
+
+后台监听进程会持续持有与 daemon 的 WebSocket 连接（Codex 审批不会因前台退出而失效），并把每条事件带自增 `seq` 落盘到 `events.jsonl`，前台通过 `wait-cursor` 按序消费，不会漏事件。
 
 ## 缓存心跳：避免 Claude 缓存过期
 
@@ -131,7 +154,7 @@ Claude 每被唤醒一次，它的 prompt 缓存有效期就从头算。静默�
 
 - Codex 依赖实验性的 app-server 协议（已测 Codex CLI 0.166.0 / daemon 0.167.0）；`agy` 依赖 `agy acp` 协议（已测 `agy 1.5.15`），CLI 升级后可能需要跟进适配。
 - Monitor 最长 30 分钟，长任务到期后用 `watch` 续上。
-- 单元测试（`bun test`）共 22 项，覆盖护栏、策略引擎、fail-closed 自审核、`Session` 状态机以及基于真实子进程模拟 ACP 的全链路测试；真实端到端已测 `agy 1.5.15` 与 `Codex CLI 0.166.0`。
+- 单元测试（`bun test`）共 26 项，覆盖护栏、一次性等待与审批不断链、策略引擎、fail-closed 自审核、`Session` 状态机以及基于真实子进程模拟 ACP 的全链路测试；真实端到端已测 `agy 1.5.15` 与 `Codex CLI 0.166.0`。
 
 ## License
 

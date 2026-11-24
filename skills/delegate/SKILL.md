@@ -62,6 +62,7 @@ Codex 旁观命令必须带线程 ID（名字不行），以事件里的 `observ
 
 ## 其他命令
 
+- `bridge start ... --once` / `bridge send ... --wait` / `bridge wait <线程>` / `bridge stop <线程>`：适用于无 `Monitor` 逐行唤醒的宿主（如 Antigravity）——后台托管监听进程持有审批连接，前台收到下一条需处理事件即退出唤醒。
 - `bridge models [--agent codex|agy|all]`：列出可选模型和各自支持的思考深度。
 - `bridge list [--agent codex|agy|all]`：列出 claude-codex-bridge 开过的线程。
 - `bridge history <线程> [--limit N]`：看最近几轮的提问与汇报。

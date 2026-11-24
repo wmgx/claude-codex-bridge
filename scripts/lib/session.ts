@@ -4,14 +4,22 @@
 import { Client } from "./client";
 import { ensureDaemon as ensureCodexDaemon } from "./daemon";
 import { out, sleep } from "./out";
-import { type Backend, takeDecision, writeLastEmitted, writeStatus } from "./state";
+import {
+  type Backend,
+  type PendingApprovalSummary,
+  appendEvent,
+  releaseWatcher,
+  takeDecision,
+  writeLastEmitted,
+  writeStatus,
+} from "./state";
 
 const HEARTBEAT_MS = 30_000;
 const POLL_MS = 500;
 const APPROVAL_TIMEOUT_MS = 10 * 60_000;
 const RECONNECT_GIVE_UP_MS = 10 * 60_000;
 
-type PendingApproval = { reqId: unknown; deadline: number };
+type PendingApproval = { reqId: unknown; deadline: number; summary: PendingApprovalSummary };
 
 const APPROVAL_KIND: Record<string, string> = {
   "item/commandExecution/requestApproval": "command",
@@ -22,6 +30,8 @@ export type SessionBackendHooks = {
   backend?: Backend;
   ensureDaemon?: () => Promise<void>;
   connect?: () => Promise<Client>;
+  idleExitMs?: number;
+  onIdleExit?: () => void;
 };
 
 // 一个 turn 里最后的汇报：优先 final_answer，没有就取最后一条 agentMessage。
@@ -42,9 +52,12 @@ export class Session {
   private activeTurnId?: string;
   private crashedTurn?: string; // 断线时正在跑的轮次；重连后它若没正常完成，就是执行端崩了
   private quietTimer?: ReturnType<typeof setTimeout>;
+  private idleTimer?: ReturnType<typeof setTimeout>;
   private readonly backend: Backend;
   private readonly ensureDaemonFn: () => Promise<void>;
   private readonly connectFn: () => Promise<Client>;
+  private readonly idleExitMs: number;
+  private readonly onIdleExitFn?: () => void;
 
   // baseline: 最后一个已上报的完成轮，之后完成的轮次都要上报。
   // null 表示还没上报过任何轮次（线程刚创建）；
@@ -63,15 +76,20 @@ export class Session {
     this.backend = hooks.backend ?? "codex";
     this.ensureDaemonFn = hooks.ensureDaemon ?? ensureCodexDaemon;
     this.connectFn = hooks.connect ?? (() => Client.connect());
+    this.idleExitMs = hooks.idleExitMs ?? 0;
+    this.onIdleExitFn = hooks.onIdleExit;
   }
 
-  // 所有对外事件都经过这里：输出即唤醒了 Claude，静默计时重新开始。
+  // 所有对外事件都经过这里：输出即唤醒了宿主，同时落盘 events.jsonl 供 wait/--once 消费。
   private emit(o: Record<string, unknown>) {
-    out({ agent: this.backend, ...o });
+    const payload = { agent: this.backend, ...o };
+    appendEvent(this.threadId, payload);
+    out(payload);
     this.rearmQuiet();
+    this.rearmIdle();
   }
 
-  // 只在有一轮正在跑、且没有审批在等用户时计时（等审批时 Claude 已经在等用户，不算静默）。
+  // 只在有一轮正在跑、且没有审批在等用户时计时（等审批时宿主已经在等用户，不算静默）。
   private rearmQuiet() {
     if (this.quietTimer) clearTimeout(this.quietTimer);
     this.quietTimer = undefined;
@@ -84,9 +102,30 @@ export class Session {
     );
   }
 
+  // 后台托管监听进程（--idle-exit）在无活跃轮次且无待审请求持续超过阈值时自动退出，防止孤儿进程堆积。
+  private rearmIdle() {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
+    if (this.idleExitMs <= 0 || this.activeTurnId || this.approvals.size > 0) return;
+    this.idleTimer = setTimeout(() => {
+      this.stop();
+      releaseWatcher(this.threadId);
+      if (this.onIdleExitFn) this.onIdleExitFn();
+      else process.exit(0);
+    }, this.idleExitMs);
+    this.idleTimer.unref?.();
+  }
+
   private setActiveTurn(turnId?: string) {
     this.activeTurnId = turnId;
     this.rearmQuiet();
+    this.rearmIdle();
+  }
+
+  // 标记监听进程已挂接就绪（供 start --once / send --wait 确认后台监听已订阅后再发轮次）。
+  markReady(threadStatus?: string) {
+    this.saveStatus("up", threadStatus, true);
+    this.rearmIdle();
   }
 
   // 接管一条已建立的连接（start 用同一条连接开线程，避免漏事件）。
@@ -131,6 +170,8 @@ export class Session {
     this.timers = [];
     if (this.quietTimer) clearTimeout(this.quietTimer);
     this.quietTimer = undefined;
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
   }
 
   private emitTurn(turnId: string, status: string, text: string, actualModel?: string) {
@@ -181,7 +222,16 @@ export class Session {
     }
     const requestId = String(m.id);
     takeDecision(this.threadId, requestId); // 丢弃同 ID 的残留决定，避免旧的批准落到新请求上
-    this.approvals.set(requestId, { reqId: m.id, deadline: Date.now() + APPROVAL_TIMEOUT_MS });
+    const summary: PendingApprovalSummary = {
+      requestId,
+      kind,
+      ...(m.params.command ? { command: m.params.command } : {}),
+      ...(m.params.grantRoot ? { grantRoot: m.params.grantRoot } : {}),
+      ...(m.params.cwd ? { cwd: m.params.cwd } : {}),
+      ...(m.params.reason ? { reason: m.params.reason } : {}),
+    };
+    this.approvals.set(requestId, { reqId: m.id, deadline: Date.now() + APPROVAL_TIMEOUT_MS, summary });
+    this.saveStatus("up");
     this.emit({
       event: "approval_requested",
       threadId: this.threadId,
@@ -202,14 +252,27 @@ export class Session {
       if (!decision && !expired) continue;
       this.approvals.delete(requestId);
       this.client?.respond(p.reqId, { decision: decision ?? "decline" });
-      // 正常批准或拒绝是 Claude 自己刚执行的，不用再唤醒它一次；只有超时自动拒绝才上报。
-      if (decision) this.rearmQuiet();
-      else this.emit({ event: "approval_resolved", threadId: this.threadId, requestId, decision: "decline", timedOut: true });
+      this.saveStatus("up");
+      // 正常批准或拒绝是宿主刚执行的，不用再唤醒一次；只有超时自动拒绝才上报。
+      if (decision) {
+        this.rearmQuiet();
+        this.rearmIdle();
+      } else {
+        this.emit({ event: "approval_resolved", threadId: this.threadId, requestId, decision: "decline", timedOut: true });
+      }
     }
   }
 
-  private saveStatus(daemon: "up" | "reconnecting" | "down", thread?: string) {
-    writeStatus(this.threadId, { backend: this.backend, daemon, thread, activeTurnId: this.activeTurnId });
+  private saveStatus(daemon: "up" | "reconnecting" | "down", thread?: string, ready = true) {
+    const pendingApprovals = [...this.approvals.values()].map(a => a.summary);
+    writeStatus(this.threadId, {
+      backend: this.backend,
+      daemon,
+      thread,
+      activeTurnId: this.activeTurnId,
+      ready,
+      ...(pendingApprovals.length ? { pendingApprovals } : {}),
+    });
   }
 
   // 这一轮正在跑，执行端却已经没了（进程崩溃、daemon 重启把线程卸载）：不会再有 turn_completed，主动告诉 Claude。
@@ -274,7 +337,10 @@ export class Session {
       }
     }
     this.saveStatus("down");
-    out({ agent: this.backend, event: "closed", threadId: this.threadId, reason: "重连超时" });
+    const closed = { agent: this.backend, event: "closed", threadId: this.threadId, reason: "重连超时" };
+    appendEvent(this.threadId, closed);
+    out(closed);
+    releaseWatcher(this.threadId);
     process.exit(1);
   }
 }

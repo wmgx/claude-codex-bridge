@@ -6,6 +6,7 @@ test("拦截各种形态的 bridge.ts approve 调用", () => {
   expect(shouldAskApproval('bun "/Users/a b/scripts/bridge.ts" approve t1 req1 --session')).toBe(true);
   expect(shouldAskApproval("bun scripts/bridge.ts --agent agy approve t1 req1")).toBe(true);
   expect(shouldAskApproval("bun scripts/bridge.ts --agent=agy approve t1 req1")).toBe(true);
+  expect(shouldAskApproval("bun scripts/bridge.ts --idle-exit 60 --timeout 30 approve t1 req1")).toBe(true);
   expect(shouldAskApproval("cd /tmp && bun scripts/bridge.ts approve t1 req1")).toBe(true);
   expect(shouldAskApproval("echo ok; bun scripts/bridge.ts approve t1 req1")).toBe(true);
   expect(shouldAskApproval("sh -c 'bun scripts/bridge.ts approve t1 req1'")).toBe(true);

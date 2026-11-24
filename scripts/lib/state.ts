@@ -20,9 +20,12 @@ const file = (threadId: string, requestId: string) => join(dir(threadId), `${saf
 const lastEmittedFile = (threadId: string) => join(dir(threadId), "last-emitted");
 const watcherFile = (threadId: string) => join(dir(threadId), "watcher.pid");
 const statusFile = (threadId: string) => join(dir(threadId), "status.json");
+const eventsFile = (threadId: string) => join(dir(threadId), "events.jsonl");
+const waitCursorFile = (threadId: string) => join(dir(threadId), "wait-cursor");
 const registryFile = () => join(stateBase(), "threads.json");
 
 export const auditLogPath = (threadId: string) => join(dir(threadId), "audit.jsonl");
+export const eventsLogPath = (threadId: string) => eventsFile(threadId);
 
 function ensureDir(p: string) {
   mkdirSync(p, { recursive: true, mode: 0o700 });
@@ -75,6 +78,14 @@ export function claimWatcher(threadId: string) {
   write(threadId, watcherFile(threadId), String(process.pid));
 }
 
+// 仅当 watcher.pid 属于当前进程时清理，避免误删新监听进程的记录。
+export function releaseWatcher(threadId: string) {
+  try {
+    const pid = Number(readFileSync(watcherFile(threadId), "utf8"));
+    if (pid === process.pid) rmSync(watcherFile(threadId), { force: true });
+  } catch {}
+}
+
 // 该线程仍在运行的监听进程 pid；没有则返回 undefined。
 export function watcherPid(threadId: string): number | undefined {
   try {
@@ -87,7 +98,16 @@ export function watcherPid(threadId: string): number | undefined {
   }
 }
 
-// 监听进程每次探活后写一份：Claude 随时能用 `status` 查到执行端是否还活着，不必等事件。
+export type PendingApprovalSummary = {
+  requestId: string;
+  kind: string;
+  command?: string;
+  grantRoot?: string;
+  cwd?: string;
+  reason?: string;
+};
+
+// 监听进程每次探活后写一份：Claude / Antigravity 随时能用 `status` 查到执行端是否还活着及待审请求。
 export type Status = {
   pid: number;
   updatedAt: string;
@@ -95,6 +115,8 @@ export type Status = {
   thread?: string;
   activeTurnId?: string;
   backend?: Backend;
+  ready?: boolean;
+  pendingApprovals?: PendingApprovalSummary[];
 };
 
 export function writeStatus(threadId: string, s: Omit<Status, "pid" | "updatedAt">) {
@@ -103,6 +125,50 @@ export function writeStatus(threadId: string, s: Omit<Status, "pid" | "updatedAt
 
 export function readStatus(threadId: string): Status | undefined {
   try { return JSON.parse(readFileSync(statusFile(threadId), "utf8")); } catch { return undefined; }
+}
+
+// 线程事件日志（供 --once / wait / send --wait 无竞争消费，每行带单调递增 seq）。
+export type RecordedEvent = Record<string, unknown> & { seq: number; at: string };
+
+export function readEvents(threadId: string): RecordedEvent[] {
+  try {
+    const raw = readFileSync(eventsFile(threadId), "utf8");
+    const out: RecordedEvent[] = [];
+    for (const line of raw.split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      try { out.push(JSON.parse(t)); } catch {}
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+export function latestEventSeq(threadId: string): number {
+  const list = readEvents(threadId);
+  return list.at(-1)?.seq ?? 0;
+}
+
+export function appendEvent(threadId: string, event: Record<string, unknown>): RecordedEvent {
+  ensureDir(dir(threadId));
+  const seq = latestEventSeq(threadId) + 1;
+  const rec: RecordedEvent = { ...event, seq, at: new Date().toISOString() };
+  appendFileSync(eventsFile(threadId), JSON.stringify(rec) + "\n", { mode: 0o600 });
+  return rec;
+}
+
+export function readWaitCursor(threadId: string): number {
+  try {
+    const n = Number(readFileSync(waitCursorFile(threadId), "utf8").trim());
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export function writeWaitCursor(threadId: string, seq: number) {
+  write(threadId, waitCursorFile(threadId), String(seq));
 }
 
 // 权限审计日志（每行一条 JSON，供排障和人工核查自审核/白名单放行记录）。

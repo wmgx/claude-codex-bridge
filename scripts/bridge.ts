@@ -1,15 +1,21 @@
 #!/usr/bin/env bun
-// claude-codex-bridge：让 Claude Code 通过本机 daemon 向 Codex 或 Antigravity (agy) 开线程、派活、收事件。
+// claude-codex-bridge：让 Claude Code / Antigravity 通过本机 daemon 向 Codex 或 Antigravity (agy) 开线程、派活、收事件。
 //
 //   doctor [--agent codex|agy|all]
-//   start <cwd> <text> [--agent codex|agy] [--name N] [--max-quiet M] [--model X] [--effort E] [--no-network]
-//                                      开线程并发第一轮，之后持续输出事件；默认 codex、默认允许联网
-//   watch <thread> [--agent codex|agy] [--max-quiet M]   重新订阅已有线程的事件（自动按注册表识别后端）
-//   send <thread> <text> [--agent codex|agy] [--model X] [--effort E]   在同一线程继续发一轮
+//   start <cwd> <text> [--agent codex|agy] [--name N] [--max-quiet M] [--model X] [--effort E] [--no-network] [--once] [--timeout S]
+//                                      开线程并发第一轮；默认持续流式输出事件（Claude Monitor）；
+//                                      加 --once 则后台托管监听并等到下一条需处理事件后立刻退出（适配 Antigravity 等非 Monitor 宿主）
+//   watch <thread> [--agent codex|agy] [--max-quiet M] [--idle-exit M] [--once] [--timeout S]
+//                                      重新订阅已有线程的事件（自动按注册表识别后端）
+//   send <thread> <text> [--agent codex|agy] [--model X] [--effort E] [--wait] [--timeout S]
+//                                      在同一线程继续发一轮；加 --wait 自动确保后台监听并等到下一条事件后退出
+//   wait <thread> [--agent codex|agy] [--timeout S]
+//                                      等待该线程的下一条需处理事件（如审批后继续等 turn_completed）并立刻退出
+//   stop <thread> [--agent codex|agy]  停止该线程的后台监听进程（不删除线程历史）
 //   （start / send 的 <text> 可以换成 --file <路径>，从文件读，避免长文本的 shell 转义问题）
 //   approve <thread> <requestId> [--session]   同意一个审批请求（--session：本会话内同类免问）
 //   deny <thread> <requestId>          拒绝一个审批请求
-//   status <thread> [--agent codex|agy]查执行端是否还活着：daemon、线程状态、监听进程（只读，不拉起 daemon）
+//   status <thread> [--agent codex|agy]查执行端是否还活着：daemon、线程状态、监听进程、待审请求（只读，不拉起 daemon）
 //   models [--agent codex|agy|all]     列出可选模型及各自支持的思考深度
 //   list [--agent codex|agy|all]       列出 claude-codex-bridge 开过的线程
 //   history <thread> [--limit N]       看最近几轮的提问与汇报
@@ -41,12 +47,15 @@ import {
   claimWatcher,
   findRegisteredThreads,
   getThreadRecord,
+  latestEventSeq,
   readLastEmitted,
   readStatus,
   registerThread,
+  releaseWatcher,
   watcherPid,
   writeDecision,
   writeLastEmitted,
+  writeWaitCursor,
 } from "./lib/state";
 import {
   PREFIX,
@@ -62,10 +71,17 @@ import {
   startThread,
   threadHistory,
 } from "./lib/threads";
+import {
+  ensureDetachedWatcher,
+  stopWatcher,
+  stripInternalFields,
+  waitForNextEvent,
+} from "./lib/waiter";
 
 type Flags = Map<string, string | true>;
 
-const VALUE_FLAGS = new Set(["--agent", "--name", "--limit", "--max-quiet", "--file", "--model", "--effort"]);
+const BOOL_FLAGS = new Set(["--session", "--no-network", "--once", "--wait"]);
+const VALUE_FLAGS = new Set(["--agent", "--name", "--limit", "--max-quiet", "--file", "--model", "--effort", "--idle-exit", "--timeout"]);
 
 // 允许 flag 出现在子命令前或后，并支持 --flag=value 写法。
 function parseArgs(argv: string[]) {
@@ -73,10 +89,8 @@ function parseArgs(argv: string[]) {
   const flags: Flags = new Map();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--session") {
-      flags.set("session", true);
-    } else if (a === "--no-network") {
-      flags.set("no-network", true);
+    if (BOOL_FLAGS.has(a)) {
+      flags.set(a.slice(2), true);
     } else if (VALUE_FLAGS.has(a)) {
       const v = argv[++i];
       if (v === undefined) throw new BridgeError(`${a} 后面需要一个值`);
@@ -98,13 +112,17 @@ function parseArgs(argv: string[]) {
 // 默认按 1 小时 prompt 缓存有效期留出余量。
 const DEFAULT_MAX_QUIET_MIN = 50;
 
-function quietMs(flags: Flags): number {
-  const raw = flags.get("max-quiet");
-  if (raw === undefined) return DEFAULT_MAX_QUIET_MIN * 60_000;
-  const min = Number(raw);
-  if (raw === "" || !Number.isFinite(min) || min < 0) throw new BridgeError("--max-quiet 需要非负数字（分钟）");
-  return min * 60_000;
+function nonNegNumber(flags: Flags, key: string, defaultVal: number, unitLabel: string): number {
+  const raw = flags.get(key);
+  if (raw === undefined) return defaultVal;
+  const n = Number(raw);
+  if (raw === "" || !Number.isFinite(n) || n < 0) throw new BridgeError(`--${key} 需要非负数字（${unitLabel}）`);
+  return n;
 }
+
+const quietMs = (flags: Flags) => nonNegNumber(flags, "max-quiet", DEFAULT_MAX_QUIET_MIN, "分钟") * 60_000;
+const idleExitMs = (flags: Flags) => nonNegNumber(flags, "idle-exit", 0, "分钟") * 60_000;
+const waitTimeoutMs = (flags: Flags) => nonNegNumber(flags, "timeout", 0, "秒") * 1000;
 
 const turnOptions = (flags: Flags): TurnOptions => ({
   model: flags.get("model") as string | undefined,
@@ -122,12 +140,24 @@ function textOf(pos: string[], flags: Flags, idx: number): string {
   return text;
 }
 
-function sessionHooks(backend: Backend) {
+function sessionHooks(backend: Backend, idleMs = 0) {
   return {
     backend,
     ensureDaemon: () => ensureBackendDaemon(backend),
     connect: () => Client.connect(backendSocket(backend)),
+    idleExitMs: idleMs,
   };
+}
+
+function installSignalCleanup(threadId: string, session: Session, client?: Client) {
+  const clean = () => {
+    session.stop();
+    try { client?.close(); } catch {}
+    releaseWatcher(threadId);
+    process.exit(0);
+  };
+  process.on("SIGTERM", clean);
+  process.on("SIGINT", clean);
 }
 
 // 从本地注册表和 agy 磁盘记录推断线程属于哪个后端（不拉起任何 daemon）。
@@ -168,6 +198,31 @@ async function resolveTarget(ref: string, explicit?: Backend): Promise<{ backend
     registerThread({ threadId, backend: inferred.backend });
   }
   return { backend: inferred.backend, client, threadId };
+}
+
+async function emitAndExitOnWait(backend: Backend, threadId: string, timeoutMs: number): Promise<never> {
+  const res = await waitForNextEvent(threadId, { timeoutMs });
+  if (res.kind === "event") {
+    out(stripInternalFields(res.event));
+    process.exit(0);
+  }
+  if (res.kind === "timeout") {
+    out({
+      agent: backend,
+      event: "wait_timeout",
+      threadId,
+      timeoutSec: timeoutMs / 1000,
+      hint: "任务仍在后台运行；可继续用 `bridge wait` 等待或 `bridge status` 查看状态",
+    });
+    process.exit(0);
+  }
+  out({
+    agent: backend,
+    event: "watcher_exited",
+    threadId,
+    hint: "监听进程已退出，用 `status` 查看线程状态或 `watch` 重新挂上",
+  });
+  process.exit(1);
 }
 
 async function doctor(flags: Flags) {
@@ -224,7 +279,6 @@ async function doctor(flags: Flags) {
 
   if (filter === "codex") process.exit(coreOk && codexReady ? 0 : 1);
   if (filter === "agy") process.exit(coreOk && agyAllReady ? 0 : 1);
-  // filter === "all"：只要 Bun 就绪且至少有一个执行端可用即返回 0，避免单端用户被另一端未安装阻塞。
   process.exit(coreOk && (codexReady || agyCliReady) ? 0 : 1);
 }
 
@@ -276,6 +330,7 @@ async function status(ref: string, explicit?: Backend) {
     running,
     watcher: watcher ?? null,
     watcherReport: saved ? { daemon: saved.daemon, updatedAt: saved.updatedAt } : null,
+    ...(saved?.pendingApprovals?.length ? { pendingApprovals: saved.pendingApprovals } : {}),
   });
   process.exit(0);
 }
@@ -301,7 +356,6 @@ async function listAllThreads(filter: Backend | "all") {
       rows.push(...(await listThreads(c, "agy")));
       c.close();
     } else {
-      // agy-daemon 未运行时直接从磁盘读取历史线程，无需为了 list 拉起常驻进程
       for (const t of listStoredAgyThreads()) {
         if (!t.name.startsWith(PREFIX)) continue;
         const shape = toBridgeThreadShape(t, false);
@@ -343,20 +397,47 @@ async function main() {
     const backend = parseBackend(flags.get("agent"), "codex");
     const cwd = pos[0];
     const text = textOf(pos, flags, 1);
-    const quiet = quietMs(flags); // 参数有问题要在开线程之前报出来
+    const quiet = quietMs(flags);
+    const once = flags.has("once") || flags.has("wait");
+    const timeout = waitTimeoutMs(flags);
     const opts = { ...turnOptions(flags), network: !flags.has("no-network") };
     const c = await connectBackend(backend);
     const name = typeof flags.get("name") === "string" && flags.get("name") ? String(flags.get("name")) : defaultName(text);
     const threadId = await startThread(c, cwd, name, { backend, ...opts });
     registerThread({ threadId, backend, name, cwd });
-    claimWatcher(threadId);
     writeLastEmitted(threadId, null);
+    writeWaitCursor(threadId, latestEventSeq(threadId));
+    const observe = observeCommand(backend, threadId);
+
+    if (once) {
+      // 后台托管 watcher 持续持有 WebSocket 连接（确保审批不掉链），前台等下一条事件即退出。
+      const { pid } = await ensureDetachedWatcher(threadId, backend);
+      await sendTurn(c, threadId, text, opts);
+      c.close();
+      out({
+        agent: backend,
+        event: "started",
+        threadId,
+        name,
+        mode: "auto",
+        model: opts.model ?? "default",
+        effort: opts.effort ?? "default",
+        network: opts.network,
+        once: true,
+        watcher: pid,
+        ...(observe ? { observe } : {}),
+      });
+      return emitAndExitOnWait(backend, threadId, timeout);
+    }
+
+    claimWatcher(threadId);
     // 先挂好事件处理再发第一轮，用同一条连接，不会漏掉快速结束的事件。
-    const session = new Session(threadId, null, quiet, sessionHooks(backend));
+    const session = new Session(threadId, null, quiet, sessionHooks(backend, idleExitMs(flags)));
     session.attach(c);
     session.run();
+    session.markReady();
+    installSignalCleanup(threadId, session, c);
     await sendTurn(c, threadId, text, opts);
-    const observe = observeCommand(backend, threadId);
     out({
       agent: backend,
       event: "started",
@@ -375,15 +456,34 @@ async function main() {
   if (cmd === "watch") {
     need(1);
     const quiet = quietMs(flags);
+    const once = flags.has("once") || flags.has("wait");
+    const timeout = waitTimeoutMs(flags);
     const { backend, client: c, threadId } = await resolveTarget(pos[0], explicitAgent());
+    const observe = observeCommand(backend, threadId);
+
+    if (once) {
+      c.close();
+      const { pid } = await ensureDetachedWatcher(threadId, backend);
+      out({
+        agent: backend,
+        event: "watching",
+        threadId,
+        once: true,
+        watcher: pid,
+        ...(observe ? { observe } : {}),
+      });
+      return emitAndExitOnWait(backend, threadId, timeout);
+    }
+
     const pid = watcherPid(threadId);
-    if (pid) throw new BridgeError(`线程已有监听进程（pid ${pid}）`, "不需要重复 watch；确实要换一个，先结束那个进程");
+    if (pid) throw new BridgeError(`线程已有监听进程（pid ${pid}）`, "不需要重复 watch；确实要换一个，先结束那个进程（可用 `bridge stop`）");
     claimWatcher(threadId);
-    const session = new Session(threadId, readLastEmitted(threadId), quiet, sessionHooks(backend));
+    const session = new Session(threadId, readLastEmitted(threadId), quiet, sessionHooks(backend, idleExitMs(flags)));
     session.attach(c);
     await session.resume(c);
     session.run();
-    const observe = observeCommand(backend, threadId);
+    session.markReady();
+    installSignalCleanup(threadId, session, c);
     out({
       agent: backend,
       event: "watching",
@@ -394,10 +494,57 @@ async function main() {
     return;
   }
 
+  if (cmd === "wait") {
+    need(1);
+    const timeout = waitTimeoutMs(flags);
+    const inferred = inferBackendOffline(pos[0], explicitAgent());
+    let backend = inferred.backend;
+    let threadId = inferred.threadId;
+    if (!threadId) {
+      const resolved = await resolveTarget(pos[0], explicitAgent());
+      backend = resolved.backend;
+      threadId = resolved.threadId;
+      resolved.client.close();
+    }
+    await ensureDetachedWatcher(threadId, backend);
+    return emitAndExitOnWait(backend, threadId, timeout);
+  }
+
+  if (cmd === "stop") {
+    need(1);
+    const inferred = inferBackendOffline(pos[0], explicitAgent());
+    let backend = inferred.backend;
+    let threadId = inferred.threadId;
+    if (!threadId) {
+      const resolved = await resolveTarget(pos[0], explicitAgent());
+      backend = resolved.backend;
+      threadId = resolved.threadId;
+      resolved.client.close();
+    }
+    const res = await stopWatcher(threadId);
+    out({ agent: backend, threadId, ...res });
+    process.exit(0);
+  }
+
   if (cmd === "send") {
     need(flags.has("file") ? 1 : 2);
     const text = textOf(pos, flags, 1);
+    const wait = flags.has("wait") || flags.has("once");
+    const timeout = waitTimeoutMs(flags);
     const { backend, client: c, threadId } = await resolveTarget(pos[0], explicitAgent());
+
+    if (wait) {
+      // 确保后台监听已就绪后再发新轮次，并将游标对齐到发轮前，避免误读更早历史事件。
+      const { pid } = await ensureDetachedWatcher(threadId, backend);
+      if (!readStatus(threadId)?.pendingApprovals?.length) {
+        writeWaitCursor(threadId, latestEventSeq(threadId));
+      }
+      await sendTurn(c, threadId, text, turnOptions(flags));
+      c.close();
+      out({ agent: backend, sent: true, threadId, watching: true, watcher: pid });
+      return emitAndExitOnWait(backend, threadId, timeout);
+    }
+
     await sendTurn(c, threadId, text, turnOptions(flags));
     const watching = watcherPid(threadId) !== undefined;
     out({
@@ -467,7 +614,7 @@ async function main() {
     process.exit(0);
   }
 
-  throw new BridgeError("未知命令", "doctor | start | watch | send | approve | deny | status | models | list | history | rename | daemon stop");
+  throw new BridgeError("未知命令", "doctor | start | watch | wait | stop | send | approve | deny | status | models | list | history | rename | daemon stop");
 }
 
 main().catch(e => {

@@ -3,7 +3,7 @@
 // 批准权不能只靠提示词约束：Codex / Antigravity (agy) 的汇报会进入 Claude 的上下文，可能诱导它自行批准。
 // 其他命令（包括 deny，以及 send/start 正文里出现 approve 字样）不拦，直接放行。
 
-const VALUE_FLAGS = new Set(["--agent", "--name", "--limit", "--max-quiet", "--file", "--model", "--effort"]);
+const VALUE_FLAGS = new Set(["--agent", "--name", "--limit", "--max-quiet", "--file", "--model", "--effort", "--idle-exit", "--timeout"]);
 const SHELL_BINS = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
 
 type Token = { text: string; quoted: boolean };
